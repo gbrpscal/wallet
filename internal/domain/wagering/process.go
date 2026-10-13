@@ -199,7 +199,7 @@ func (p processor) processed(entry *wallet.LedgerEntry, ref domain.TransactionID
 	}
 	events := []event.Event{processed}
 	if entry != nil {
-		changed, err := event.NewWalletBalanceChanged(p.trace, p.now, *entry, p.w.Version())
+		changed, err := event.NewWalletBalanceChanged(p.trace, p.now, *entry)
 		if err != nil {
 			return Outcome{}, err
 		}

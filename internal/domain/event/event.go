@@ -239,8 +239,8 @@ type WalletBalanceChanged struct {
 }
 
 // NewWalletBalanceChanged constrói a versão 1 do evento a partir de um
-// lançamento e da versão de carteira que esse lançamento produziu.
-func NewWalletBalanceChanged(trace Trace, now time.Time, entry wallet.LedgerEntry, walletVersion int64) (WalletBalanceChanged, error) {
+// lançamento; walletVersion é a versão de carteira que o lançamento produziu.
+func NewWalletBalanceChanged(trace Trace, now time.Time, entry wallet.LedgerEntry) (WalletBalanceChanged, error) {
 	d := WalletBalanceChangedData{
 		WalletID:      entry.WalletID(),
 		TransactionID: entry.TransactionID(),
@@ -248,7 +248,7 @@ func NewWalletBalanceChanged(trace Trace, now time.Time, entry wallet.LedgerEntr
 		Money:         entry.Amount(),
 		BalanceBefore: entry.BalanceBefore(),
 		BalanceAfter:  entry.BalanceAfter(),
-		WalletVersion: walletVersion,
+		WalletVersion: entry.WalletVersion(),
 	}
 	h, err := newHeader(TypeWalletBalanceChanged, 1, d.WalletID.String(), trace, now)
 	if err != nil {

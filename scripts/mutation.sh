@@ -6,6 +6,11 @@
 # Uso (pelo container de toolchain):
 #   docker compose run --rm tools bash scripts/mutation.sh
 #
+# Os mutantes de persistência rodam os testes com a tag integration e exigem
+# o PostgreSQL do Compose no ar (docker compose up -d --wait postgres). Antes
+# de cada grupo, os testes rodam sem mutação: se essa linha de base falhar, o
+# script aborta, para que uma falha de ambiente não conte como mutante morto.
+#
 # Resultados:
 #   KILLED   um teste falhou por causa do defeito (esperado)
 #   SURVIVED nenhum teste falhou: a regra não está protegida por teste
@@ -22,6 +27,19 @@ trap 'rm -rf "$WORK"' EXIT
 killed=0
 bad=0
 
+# Um mutante que trave o teste (por exemplo, esperando um lock para sempre) é
+# morto pelo timeout.
+TEST_TIMEOUT="${TEST_TIMEOUT:-120s}"
+
+# baseline <pacotes> [tags]: os testes precisam passar sem mutação.
+baseline() {
+  local pkgs="$1" tags="${2:-}"
+  if ! (cd "$SRC" && go test -count=1 -timeout "$TEST_TIMEOUT" ${tags:+-tags=$tags} $pkgs >/dev/null 2>&1); then
+    echo "ERROR    linha de base falhou para $pkgs ${tags:+(tags: $tags)}; corrija o ambiente antes"
+    exit 1
+  fi
+}
+
 # mutate <nome> <arquivo> <trecho original> <trecho mutado> [pacotes] [tags]
 mutate() {
   local name="$1" file="$2" from="$3" to="$4" pkgs="${5:-./internal/domain/...}" tags="${6:-}"
@@ -32,7 +50,7 @@ mutate() {
     return
   fi
   local out status
-  out=$(cd "$WORK/src" && go test -count=1 ${tags:+-tags=$tags} $pkgs 2>&1)
+  out=$(cd "$WORK/src" && go test -count=1 -timeout "$TEST_TIMEOUT" ${tags:+-tags=$tags} $pkgs 2>&1)
   status=$?
   if echo "$out" | grep -qE '\[build failed\]|\[setup failed\]'; then
     echo "INVALID  $name (o mutante não compila)"
@@ -40,6 +58,9 @@ mutate() {
   elif [ $status -ne 0 ]; then
     local tests
     tests=$(echo "$out" | grep -E '^\s*--- FAIL' | sed -E 's/^\s*--- FAIL: ([^ ]+).*/\1/' | head -3 | paste -sd, -)
+    if [ -z "$tests" ] && echo "$out" | grep -q 'test timed out'; then
+      tests="timeout: $(echo "$out" | grep -A1 'running tests:' | tail -1 | xargs)"
+    fi
     echo "KILLED   $name <- $tests"
     killed=$((killed + 1))
   else
@@ -47,6 +68,8 @@ mutate() {
     bad=$((bad + 1))
   fi
 }
+
+baseline ./internal/domain/...
 
 # --- Money ------------------------------------------------------------------
 mutate "aceita zeros à esquerda (01.00)" internal/domain/money/money.go \
@@ -64,7 +87,9 @@ mutate "parsing aceita três casas decimais" internal/domain/money/money.go \
 mutate "débito deixa o saldo negativo" internal/domain/wallet/wallet.go \
   'if cmp < 0 {' 'if cmp < -1 {'
 mutate "versão não incrementa" internal/domain/wallet/wallet.go \
-  'w.version++' ''
+  'w.version = entry.WalletVersion()' ''
+mutate "lançamento grava a versão anterior" internal/domain/wallet/wallet.go \
+  'w.balance, after, w.version+1, now)' 'w.balance, after, w.version, now)'
 mutate "ledger aceita balanceAfter errado" internal/domain/wallet/ledger.go \
   'if !expected.Equal(s.BalanceAfter) {' 'if !expected.Equal(s.BalanceAfter) && false {'
 mutate "abertura com saldo zero cria lançamento" internal/domain/wallet/wallet.go \
@@ -121,6 +146,49 @@ mutate "hash inclui a idempotency key" internal/domain/wagering/request.go \
   '"gameId":                r.gameID,' '"gameId": r.gameID, "key": r.idempotencyKey,'
 mutate "hash com escape de HTML" internal/domain/wagering/request.go \
   'enc.SetEscapeHTML(false)' 'enc.SetEscapeHTML(true)'
+
+# --- Persistência (tag integration; exige o PostgreSQL no ar) --------------------
+PG=./internal/adapters/postgres/...
+baseline $PG integration
+
+mutate "banco aceita saldo negativo" migrations/00001_create_wallets.sql \
+  'balance_minor BIGINT      NOT NULL CHECK (balance_minor >= 0),' 'balance_minor BIGINT NOT NULL,' $PG integration
+mutate "banco aceita versão sem mudança de saldo" migrations/00001_create_wallets.sql \
+  'ELSIF NEW.version <> OLD.version THEN' 'ELSIF false THEN' $PG integration
+mutate "aplicação pode alterar e apagar o ledger" migrations/00003_create_wallet_ledger_entries.sql \
+  'GRANT SELECT, INSERT ON wallet_ledger_entries TO wallet_app;' 'GRANT SELECT, INSERT, UPDATE, DELETE ON wallet_ledger_entries TO wallet_app;' $PG integration
+mutate "dono do schema pode apagar lançamento" migrations/00003_create_wallet_ledger_entries.sql \
+  'CREATE TRIGGER wallet_ledger_entries_no_delete BEFORE DELETE ON wallet_ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION wallet_ledger_entries_immutable();' '' $PG integration
+mutate "saldo confirmado sem lançamento" migrations/00003_create_wallet_ledger_entries.sql \
+  'CREATE CONSTRAINT TRIGGER wallets_ledger_consistency
+    AFTER INSERT OR UPDATE ON wallets' 'CREATE CONSTRAINT TRIGGER wallets_ledger_consistency
+    AFTER INSERT ON wallets' $PG integration
+mutate "cadeia do ledger não conferida" migrations/00003_create_wallet_ledger_entries.sql \
+  'IF NEW.wallet_version <> prev.wallet_version + 1
+            OR NEW.balance_before_minor <> prev.balance_after_minor THEN' 'IF false THEN' $PG integration
+mutate "duas reversões da mesma aposta" migrations/00002_create_wager_transactions.sql \
+  'CREATE UNIQUE INDEX wager_transactions_one_reversal_uq' 'CREATE INDEX wager_transactions_one_reversal_uq' $PG integration
+mutate "crédito inicial duplicado" migrations/00002_create_wager_transactions.sql \
+  'CREATE UNIQUE INDEX wager_transactions_opening_uq' 'CREATE INDEX wager_transactions_opening_uq' $PG integration
+mutate "chave de idempotência global (sem isolamento por provedor)" migrations/00002_create_wager_transactions.sql \
+  'ON wager_transactions (provider_id, idempotency_key) WHERE' 'ON wager_transactions (idempotency_key) WHERE' $PG integration
+mutate "transação volta para PENDING" migrations/00002_create_wager_transactions.sql \
+  "AND NEW.status IN ('PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'))" "AND NEW.status IN ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'))" $PG integration
+mutate "banco aceita código de falha desconhecido" migrations/00002_create_wager_transactions.sql \
+  "OR (status = 'REJECTED' AND failure_code IN (" "OR (status = 'REJECTED' AND failure_code IS NOT NULL) OR (false AND failure_code IN (" $PG integration
+mutate "payload da outbox pode mudar" migrations/00004_create_inbox_outbox.sql \
+  'NEW.payload::text, NEW.occurred_at)' 'NEW.payload::text, NEW.occurred_at, NULL)' $PG integration
+mutate "lock da carteira sem FOR UPDATE" internal/adapters/postgres/wallets.go \
+  'FROM wallets WHERE id = $1 FOR UPDATE`' 'FROM wallets WHERE id = $1`' $PG integration
+mutate "UPDATE sem checar a versão" internal/adapters/postgres/wallets.go \
+  'WHERE id = $1 AND version = $5`' 'WHERE id = $1 AND $5::bigint IS NOT NULL`' $PG integration
+mutate "lock_timeout não classificado como transitório" internal/adapters/postgres/errors.go \
+  '"55P03": true,' '' $PG integration
+mutate "lock_timeout não aplicado" internal/adapters/postgres/uow.go \
+  'if u.lockTimeout > 0 {' 'if false {' $PG integration
+mutate "busca de replay sem escopo de provedor" internal/adapters/postgres/transactions.go \
+  'WHERE provider_id = $1 AND idempotency_key = $2' 'WHERE $1::text IS NOT NULL AND idempotency_key = $2' $PG integration
 
 echo
 echo "mutantes mortos: $killed, problemas: $bad"

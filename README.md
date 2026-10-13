@@ -13,7 +13,7 @@ As decisões técnicas estão em [ARCHITECTURE.md](ARCHITECTURE.md).
 - [Execução da aplicação](#execução-da-aplicação)
 - [Variáveis de ambiente](#variáveis-de-ambiente)
 - [Filas SQS](#filas-sqs)
-- [Migrations](#migrations)
+- [Banco de dados e migrations](#banco-de-dados-e-migrations)
 - [Exemplos de chamadas](#exemplos-de-chamadas)
 - [Testes](#testes)
 - [Testes de integração, múltiplas instâncias e falha](#testes-de-integração-múltiplas-instâncias-e-falha)
@@ -89,7 +89,8 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | Endereço do servidor HTTP |
-| `DATABASE_URL` | *(obrigatória)* | URL de conexão do PostgreSQL |
+| `DATABASE_URL` | *(obrigatória)* | URL de conexão do PostgreSQL, com o papel `wallet_app` |
+| `DB_LOCK_TIMEOUT` | `5s` | Espera máxima por lock de linha; ao estourar, a operação falha como transitória e nada é confirmado |
 | `AWS_REGION` | `us-east-1` | Região do SQS |
 | `AWS_ENDPOINT_URL` | — | Endpoint do SQS (LocalStack) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` / `test` | Credenciais (lidas pelo SDK da AWS) |
@@ -105,7 +106,9 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 |---|---|---|
 | `HOST_UID` / `HOST_GID` | `1000` | Usuário do container `tools` |
 | `APP_HOST_PORT` / `KEYCLOAK_HOST_PORT` | `8080` / `8180` | Portas publicadas no host |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `wallet` | Banco local |
+| `POSTGRES_PASSWORD` | `postgres` | Senha do superusuário, usado só na criação dos papéis |
+| `WALLET_DB` | `wallet` | Nome do banco da aplicação |
+| `WALLET_OWNER_PASSWORD` / `WALLET_APP_PASSWORD` | `wallet_owner` / `wallet_app` | Senhas dos papéis `wallet_owner` (migrations) e `wallet_app` (aplicação) |
 | `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` | `admin` | Administrador local do Keycloak |
 
 Uma configuração inválida (por exemplo, `SHUTDOWN_TIMEOUT=abc`) encerra o processo na partida, com a lista de erros.
@@ -119,9 +122,35 @@ As filas são criadas automaticamente quando o LocalStack fica pronto, pelo scri
 
 *Pendente (Fase 7/8):* política de redrive, visibility timeout e o destino dos eventos de saída.
 
-## Migrations
+## Banco de dados e migrations
 
-*Pendente (Fase 4).* A ferramenta é o `goose`, já disponível no container `tools`. Os comandos de aplicação e reversão serão documentados aqui.
+Na primeira inicialização do volume, o [deploy/postgres/init-roles.sh](deploy/postgres/init-roles.sh) cria o banco `wallet` e dois papéis:
+
+| Papel | Uso | Privilégios |
+|---|---|---|
+| `wallet_owner` | migrations e testes de schema | dono do schema; `CREATEDB` para os bancos temporários dos testes |
+| `wallet_app` | aplicação | `SELECT`, `INSERT` e `UPDATE` nas tabelas; **apenas `SELECT` e `INSERT` no ledger**; nenhum `DELETE` |
+
+> O script só roda com o volume vazio. Se você já tinha o volume de uma versão anterior, recrie-o com `docker compose down -v`, que **apaga os dados locais**.
+
+As migrations ficam em [migrations/](migrations/) e são aplicadas com `goose`. No `docker compose up`, o serviço `migrate` aplica as pendentes e termina; a aplicação só sobe depois que ele conclui com sucesso.
+
+Comandos manuais pelo container `tools`, que já tem `GOOSE_DRIVER`, `GOOSE_DBSTRING` (papel `wallet_owner`) e `GOOSE_MIGRATION_DIR` configurados:
+
+| Ação | Comando |
+|---|---|
+| Situação | `docker compose run --rm tools goose status` |
+| Aplicar todas | `docker compose run --rm tools goose up` |
+| Reverter a última | `docker compose run --rm tools goose down` |
+| Reverter todas | `docker compose run --rm tools goose down-to 0` |
+
+Forma nativa, com `goose` instalado:
+
+```bash
+goose -dir migrations postgres "postgres://wallet_owner:wallet_owner@localhost:5432/wallet?sslmode=disable" up
+```
+
+Essa forma exige publicar a porta 5432 do PostgreSQL, que não é publicada por padrão.
 
 ## Exemplos de chamadas
 
@@ -156,19 +185,51 @@ docker compose run --rm tools go test -race ./...
 | `internal/domain/event` | envelope, tipo e versão, formato de valores e datas |
 | `internal/domain` | erros tipados, IDs, ausência de ponto flutuante, isolamento do domínio |
 
+### Testes de integração de persistência
+
+Os testes com a tag `integration` usam o PostgreSQL real do Compose. Cada pacote cria um banco temporário `wallet_test_<aleatório>`, aplica as migrations como `wallet_owner`, executa os testes com o papel `wallet_app` e apaga o banco ao final. O banco da aplicação não é tocado.
+
+```bash
+docker compose up -d --wait postgres
+```
+
+```bash
+docker compose run --rm tools go test -race -tags=integration ./internal/adapters/postgres/...
+```
+
+Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL` (papel `wallet_owner`) apontando para o PostgreSQL e rode `go test -race -tags=integration ./internal/adapters/postgres/...`.
+
+| Teste | O que comprova |
+|---|---|
+| `TestMigrationsApplyRevertAndReapply` | aplicação, reversão até a versão 0 e reaplicação |
+| `TestLedgerIsAppendOnly` | `UPDATE`, `DELETE` e `TRUNCATE` no ledger barrados por privilégio (aplicação) e por trigger (dono do schema) |
+| `TestBalanceChangeRequiresLedgerEntry` | saldo alterado sem lançamento não é confirmado |
+| `TestLedgerChainIsEnforced` | cada lançamento continua do anterior (saldo e versão) |
+| `TestWalletVersionRules`, `TestBalanceCannotBeNegative` | versão +1 só com mudança de saldo; saldo ≥ 0 |
+| `TestDatabaseEnforcesDomainRules`, `TestTransactionStateMachineInDatabase` | regras dos tipos, códigos de falha e máquina de estados no banco |
+| `TestIdempotencyConstraints`, `TestOneSuccessfulReversalPerReference` | unicidade por provedor, operação com outra chave, uma reversão por referência |
+| `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100` | nenhuma atualização perdida sob concorrência (um processo; vários processos ficam para a Fase 10) |
+| `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` | lock só por carteira; espera excessiva vira erro transitório |
+| `TestUnitOfWorkRollsBackEverything` | atomicidade: nada é gravado se a transação falha |
+| `TestOutboxSnapshotIsImmutable`, `TestInboxDeduplicates` | snapshot imutável da outbox; deduplicação da inbox |
+
 ### Testes de mutação
 
-O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito (por exemplo, "débito deixa o saldo negativo" ou "segunda reversão aceita") numa cópia descartável do código, e algum teste precisa falhar:
+O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger" e "lock da carteira sem FOR UPDATE". Os mutantes de persistência exigem o PostgreSQL no ar:
+
+```bash
+docker compose up -d --wait postgres
+```
 
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
 
-Cada linha mostra o defeito e os testes que o detectaram (`KILLED`). `SURVIVED` indica regra sem teste, e `INVALID` indica mutante que não compila. O script termina com erro se houver qualquer resultado diferente de `KILLED`.
+Cada linha mostra o defeito e os testes que o detectaram (`KILLED`). `SURVIVED` indica regra sem teste, e `INVALID` indica mutante que não compila. Antes de cada grupo, os testes rodam sem mutação; se essa linha de base falhar (por exemplo, com o banco fora do ar), o script aborta em vez de contar falhas de ambiente como mutantes mortos. O script termina com erro se houver qualquer resultado diferente de `KILLED`.
 
 ## Testes de integração, múltiplas instâncias e falha
 
-*Pendente (Fases 4 a 10).* Os testes são separados por build tags:
+*Parcial.* Os testes de persistência estão descritos acima; os demais virão nas Fases 5 a 10. Os testes são separados por build tags:
 
 | Tag | Conteúdo |
 |---|---|
@@ -183,10 +244,11 @@ As dependências rodam no Compose, e as instâncias da aplicação são processo
 ```
 cmd/wallet/            ponto de entrada (composição Fx)
 internal/domain/       modelo de domínio puro
-internal/app/          casos de uso
+internal/app/          casos de uso, portas (UnitOfWork, repositórios) e erros
 internal/adapters/     PostgreSQL, HTTP, SQS
 internal/platform/     configuração, logs, health
-deploy/                Keycloak, LocalStack, Toxiproxy
+deploy/                PostgreSQL (papéis), Keycloak, LocalStack, Toxiproxy
+migrations/            schema, constraints e triggers (goose)
 scripts/               testes de mutação
 compose.yaml           stack local e container de toolchain
 Dockerfile             imagens tools, build e runtime

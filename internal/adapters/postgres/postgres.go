@@ -8,17 +8,23 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 
+	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/platform/config"
 	"github.com/gbrpscal/wallet/internal/platform/health"
 )
 
-// Module fornece o pool de conexões e sua checagem de readiness.
+// Module fornece o pool de conexões, a UnitOfWork e a checagem de readiness.
 var Module = fx.Module("postgres",
 	fx.Provide(
 		NewPool,
+		fx.Annotate(newUnitOfWork, fx.As(new(app.UnitOfWork))),
 		health.AsChecker(NewReadinessCheck),
 	),
 )
+
+func newUnitOfWork(pool *pgxpool.Pool, cfg config.Config) *UnitOfWork {
+	return NewUnitOfWork(pool, cfg.DBLockTimeout)
+}
 
 // NewPool cria o pool. As conexões são abertas sob demanda, então um banco
 // temporariamente indisponível na partida não impede o processo de subir; a

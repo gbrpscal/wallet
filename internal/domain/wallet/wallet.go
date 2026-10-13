@@ -69,7 +69,7 @@ func Open(id domain.WalletID, playerID domain.PlayerID, initial money.Money, ope
 		return nil, nil, domain.Errorf(domain.ErrInconsistentState, "positive initial balance requires an opening transaction")
 	}
 	zero, _ := money.Zero(initial.Currency())
-	entry, err := newEntry(id, openingTx, Credit, initial, zero, initial, now)
+	entry, err := newEntry(id, openingTx, Credit, initial, zero, initial, InitialVersion, now)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -160,19 +160,19 @@ func (w *Wallet) checkMovement(txID domain.TransactionID, amount money.Money, no
 // somente quando o saldo muda.
 func (w *Wallet) apply(txID domain.TransactionID, dir Direction, amount, after money.Money, now time.Time) (LedgerEntry, error) {
 	now = domain.Timestamp(now)
-	entry, err := newEntry(w.id, txID, dir, amount, w.balance, after, now)
+	entry, err := newEntry(w.id, txID, dir, amount, w.balance, after, w.version+1, now)
 	if err != nil {
 		return LedgerEntry{}, err
 	}
 	w.balance = after
-	w.version++
+	w.version = entry.WalletVersion()
 	if now.After(w.updatedAt) {
 		w.updatedAt = now
 	}
 	return entry, nil
 }
 
-func newEntry(walletID domain.WalletID, txID domain.TransactionID, dir Direction, amount, before, after money.Money, now time.Time) (LedgerEntry, error) {
+func newEntry(walletID domain.WalletID, txID domain.TransactionID, dir Direction, amount, before, after money.Money, version int64, now time.Time) (LedgerEntry, error) {
 	entryID, err := domain.NewID[domain.LedgerEntryID]()
 	if err != nil {
 		return LedgerEntry{}, err
@@ -185,6 +185,7 @@ func newEntry(walletID domain.WalletID, txID domain.TransactionID, dir Direction
 		Amount:        amount,
 		BalanceBefore: before,
 		BalanceAfter:  after,
+		WalletVersion: version,
 		CreatedAt:     now,
 	})
 }

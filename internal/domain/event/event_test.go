@@ -22,12 +22,12 @@ func TestWalletBalanceChangedEnvelope(t *testing.T) {
 
 	entry, err := wallet.NewLedgerEntry(wallet.LedgerEntrySnapshot{
 		ID: entryID, WalletID: walletID, TransactionID: txID, Direction: wallet.Debit,
-		Amount: amount, BalanceBefore: before, BalanceAfter: after, CreatedAt: at,
+		Amount: amount, BalanceBefore: before, BalanceAfter: after, WalletVersion: 2, CreatedAt: at,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := event.NewWalletBalanceChanged(event.Trace{CorrelationID: "corr-1", CausationID: "msg-123"}, at, entry, 2)
+	e, err := event.NewWalletBalanceChanged(event.Trace{CorrelationID: "corr-1", CausationID: "msg-123"}, at, entry)
 	if err != nil {
 		t.Fatal(err)
 	}

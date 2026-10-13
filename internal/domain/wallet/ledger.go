@@ -26,7 +26,9 @@ func ParseDirection(s string) (Direction, error) {
 }
 
 // LedgerEntry é o registro imutável de uma mudança de saldo. Só pode ser
-// construído com balanceAfter = balanceBefore ± amount.
+// construído com balanceAfter = balanceBefore ± amount. walletVersion é a
+// versão da carteira produzida por este lançamento; ela encadeia os
+// lançamentos de uma carteira e dá a ordenação estável do ledger.
 type LedgerEntry struct {
 	id            domain.LedgerEntryID
 	walletID      domain.WalletID
@@ -35,6 +37,7 @@ type LedgerEntry struct {
 	amount        money.Money
 	balanceBefore money.Money
 	balanceAfter  money.Money
+	walletVersion int64
 	createdAt     time.Time
 }
 
@@ -48,6 +51,7 @@ type LedgerEntrySnapshot struct {
 	Amount        money.Money
 	BalanceBefore money.Money
 	BalanceAfter  money.Money
+	WalletVersion int64
 	CreatedAt     time.Time
 }
 
@@ -62,6 +66,9 @@ func NewLedgerEntry(s LedgerEntrySnapshot) (LedgerEntry, error) {
 	}
 	if s.CreatedAt.IsZero() {
 		return LedgerEntry{}, domain.Errorf(domain.ErrInconsistentState, "ledger entry requires creation time")
+	}
+	if s.WalletVersion < InitialVersion {
+		return LedgerEntry{}, domain.Errorf(domain.ErrInconsistentState, "ledger entry has invalid wallet version %d", s.WalletVersion)
 	}
 	if !s.Amount.IsValid() || !s.Amount.IsPositive() {
 		return LedgerEntry{}, domain.Errorf(domain.ErrInconsistentState, "ledger entry amount must be positive")
@@ -91,6 +98,7 @@ func NewLedgerEntry(s LedgerEntrySnapshot) (LedgerEntry, error) {
 		amount:        s.Amount,
 		balanceBefore: s.BalanceBefore,
 		balanceAfter:  s.BalanceAfter,
+		walletVersion: s.WalletVersion,
 		createdAt:     s.CreatedAt,
 	}, nil
 }
@@ -102,6 +110,7 @@ func (e LedgerEntry) Direction() Direction                { return e.direction }
 func (e LedgerEntry) Amount() money.Money                 { return e.amount }
 func (e LedgerEntry) BalanceBefore() money.Money          { return e.balanceBefore }
 func (e LedgerEntry) BalanceAfter() money.Money           { return e.balanceAfter }
+func (e LedgerEntry) WalletVersion() int64                { return e.walletVersion }
 func (e LedgerEntry) CreatedAt() time.Time                { return e.createdAt }
 
 // SignedAmount devolve +amount para créditos e -amount para débitos; usado na

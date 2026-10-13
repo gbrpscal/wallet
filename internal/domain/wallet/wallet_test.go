@@ -58,7 +58,7 @@ func TestOpenWithPositiveBalance(t *testing.T) {
 	if entry == nil {
 		t.Fatal("positive opening must produce a ledger entry")
 	}
-	if entry.Direction() != wallet.Credit || entry.TransactionID() != opening ||
+	if entry.Direction() != wallet.Credit || entry.TransactionID() != opening || entry.WalletVersion() != 1 ||
 		entry.BalanceBefore().Amount() != "0.00" || entry.BalanceAfter().Amount() != "1000.00" {
 		t.Errorf("unexpected opening entry %+v", entry)
 	}
@@ -116,7 +116,7 @@ func TestDebitAndCredit(t *testing.T) {
 	if w.Balance().Amount() != "20.00" || w.Version() != 2 {
 		t.Errorf("after debit: %v v%d", w.Balance(), w.Version())
 	}
-	if e1.BalanceBefore().Amount() != "100.00" || e1.BalanceAfter().Amount() != "20.00" || e1.Direction() != wallet.Debit {
+	if e1.BalanceBefore().Amount() != "100.00" || e1.BalanceAfter().Amount() != "20.00" || e1.Direction() != wallet.Debit || e1.WalletVersion() != 2 {
 		t.Errorf("debit entry %+v", e1)
 	}
 
@@ -221,7 +221,7 @@ func TestLedgerEntryInvariant(t *testing.T) {
 	entryID, _ := domain.NewID[domain.LedgerEntryID]()
 	base := wallet.LedgerEntrySnapshot{
 		ID: entryID, WalletID: walletID, TransactionID: txID(t), Direction: wallet.Debit,
-		Amount: brl(t, "25.00"), BalanceBefore: brl(t, "1000.00"), BalanceAfter: brl(t, "975.00"), CreatedAt: t0,
+		Amount: brl(t, "25.00"), BalanceBefore: brl(t, "1000.00"), BalanceAfter: brl(t, "975.00"), WalletVersion: 2, CreatedAt: t0,
 	}
 	if _, err := wallet.NewLedgerEntry(base); err != nil {
 		t.Fatalf("valid entry rejected: %v", err)
@@ -240,6 +240,7 @@ func TestLedgerEntryInvariant(t *testing.T) {
 		},
 		"no transaction": func(s *wallet.LedgerEntrySnapshot) { s.TransactionID = domain.TransactionID{} },
 		"no time":        func(s *wallet.LedgerEntrySnapshot) { s.CreatedAt = time.Time{} },
+		"no version":     func(s *wallet.LedgerEntrySnapshot) { s.WalletVersion = 0 },
 	}
 	for name, mutate := range mutations {
 		s := base

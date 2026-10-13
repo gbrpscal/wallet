@@ -41,14 +41,16 @@ internal/domain/             modelo puro (sem Fx, HTTP, SQS ou banco)
   wallet/                      Wallet (raiz de agregado) e LedgerEntry
   wagering/                    WagerTransaction, Request, hash e regras
   event/                       envelope e eventos concretos
-internal/app/                casos de uso e portas            (pendente)
+internal/app/                portas (UnitOfWork, repositórios), erros de infraestrutura;
+                             casos de uso (pendente)
 internal/adapters/
-  postgres/                  pool, repositórios e transação
+  postgres/                  pool, UnitOfWork, repositórios e classificação de erros
   httpapi/                   servidor, rotas e health checks
   sqs/                       cliente, consumidor e publisher
 internal/platform/
   config/  logging/  health/ configuração, logs JSON e readiness
-deploy/                      realm do Keycloak, filas, Toxiproxy
+migrations/                  schema, constraints e triggers (goose)
+deploy/                      papéis do PostgreSQL, realm do Keycloak, filas, Toxiproxy
 scripts/mutation.sh          testes de mutação curados
 ```
 
@@ -63,7 +65,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 1 | Leitura e decisões | concluída |
 | 2 | Esqueleto: toolchain, Compose, módulos Fx, health checks | concluída |
 | 3 | Domínio puro e testes unitários | concluída |
-| 4 | Persistência: migrations, constraints, repositórios | pendente |
+| 4 | Persistência: migrations, constraints, repositórios | concluída |
 | 5 | Casos de uso | pendente |
 | 6 | HTTP e autenticação | pendente |
 | 7 | Consumidor SQS | pendente |
@@ -238,7 +240,8 @@ Todas as decisões seguem o formato: **Contexto · Opções consideradas · Pró
   - `updatedAt` monotônico.
 - Em caso de rejeição, a carteira fica inalterada: o lançamento é construído antes de qualquer mutação.
 - `LedgerEntry` é imutável. O construtor exige `balanceAfter = balanceBefore ± amount`, valor positivo, saldos não negativos e moedas iguais.
-- As mesmas regras no banco (constraints, unicidade e imutabilidade do ledger) são decididas na Fase 4.
+- Além dos campos mínimos do enunciado, o lançamento grava **`walletVersion`**: a versão de carteira que ele produziu (1 na abertura com saldo; a versão anterior + 1 nas movimentações). Ela encadeia os lançamentos de uma carteira, permite ao banco conferir saldo × ledger (§4.11) e dá a ordenação estável do ledger.
+- As mesmas regras são garantidas também pelo banco (§4.11).
 
 **Como verificar:** `TestDebitAndCredit`, `TestInsufficientFundsLeavesWalletUnchanged`, `TestMovementValidation`, `TestRehydrateRejectsInconsistentState` e `TestLedgerEntryInvariant`.
 
@@ -266,7 +269,7 @@ PROCESSED, REJECTED, FAILED: terminais (nenhuma transição)
   - Uma transição inválida resulta em `INVALID_STATE_TRANSITION`, código interno que indica bug e nunca é persistido como `failureCode`.
 - **Critério impactado:** Integridade financeira e Mensageria e recuperação.
 - **Como verificar:** `TestStateMachine` (todas as 25 combinações de origem e destino), `TestTerminalTransactionsRejectTransitions`, `TestOnlyReversalsWaitForReference` e `TestMarkValidatesCodes`.
-- **Limitações:** a classificação concreta dos erros de infraestrutura (códigos SQLSTATE e erros do SDK) é implementada nos adaptadores, nas Fases 4 e 7.
+- **Limitações:** a classificação dos erros do PostgreSQL está no §4.11; a dos erros do SDK da AWS será feita na Fase 7.
 
 ### 4.6 WagerTransaction
 
@@ -313,8 +316,8 @@ PROCESSED, REJECTED, FAILED: terminais (nenhuma transição)
   - `EXTERNAL_TRANSACTION_CONFLICT` para a mesma operação com outra chave;
   - `INCONSISTENT_STATE` se uma busca cruzar provedores.
 - **Critério impactado:** Idempotência e Modelagem (autorização).
-- **Como verificar:** `TestCheckReplay`. As constraints de unicidade no banco serão verificadas na Fase 4.
-- **Limitações:** a garantia final depende dos índices únicos da Fase 4.
+- **Como verificar:** `TestCheckReplay` no domínio; no banco, os índices `wager_transactions_provider_key_uq` e `wager_transactions_provider_external_uq` (`TestIdempotencyConstraints`, `TestBetRoundTripAndLookups`, que confirma que outro provedor não enxerga a operação).
+- **Limitações:** o fluxo completo de replay (reler e devolver o resultado persistido) é implementado nos casos de uso (Fase 5).
 
 ### 4.8 Operações, referências e reversões
 
@@ -368,9 +371,9 @@ Também valem estas regras:
 - **Prós e contras:**
   - (a) é inequívoca para auditoria e impede devolução dupla.
   - (b) é mais tolerante, mas um "sucesso sem efeito" é ambíguo e conta como duas reversões bem-sucedidas.
-- **Escolha e justificativa:** (a). A segunda reversão é `REJECTED` com `ALREADY_REVERSED`, sem movimentação. Um `ROLLBACK` de um `REFUND` continua permitido, porque referencia outra transação. O índice único no banco que impõe a regra entra na Fase 4.
+- **Escolha e justificativa:** (a). A segunda reversão é `REJECTED` com `ALREADY_REVERSED`, sem movimentação. Um `ROLLBACK` de um `REFUND` continua permitido, porque referencia outra transação. O índice único `wager_transactions_one_reversal_uq` impõe a regra também no banco.
 - **Critério impactado:** Integridade financeira.
-- **Como verificar:** `TestReversalRejections/already_reversed`. O índice e a corrida entre reversões paralelas serão testados nas Fases 4 e 10.
+- **Como verificar:** `TestReversalRejections/already_reversed` (domínio) e `TestOneSuccessfulReversalPerReference` (banco). A corrida entre reversões em processos diferentes será testada na Fase 10.
 - **Limitações:** depois de `BET` → `REFUND` → `ROLLBACK do REFUND`, a `BET` não pode ser devolvida de novo (a regra é uma reversão por referência).
 
 #### D5. Referência existente mas não processada
@@ -443,12 +446,176 @@ Também valem estas regras:
 - **Como verificar:** `TestWalletBalanceChangedEnvelope`, `TestEventRequiresCorrelation`, `TestCausationIsOptional` e `TestLossHasNoMovement` (sem `WalletBalanceChanged`).
 - **Pendente:** destino dos eventos (D10) e publisher (Fase 8).
 
-### 4.11 Decisões pendentes
+### 4.11 Persistência, transações e concorrência
+
+#### D1. Concorrência por carteira: `FOR UPDATE` + versão no UPDATE
+
+- **Contexto:** "Coordenação por carteira. Locks globais são proibidos; carteiras independentes avançam em paralelo." / "Estratégia: lock pessimista, otimista com retry limitado, atualização atômica condicionada ou combinação justificada." / "Atualizações de saldo impedem lost updates."
+- **Opções consideradas:** (a) lock pessimista na linha da carteira (`SELECT … FOR UPDATE`) com a versão conferida no UPDATE; (b) UPDATE atômico condicionado (`balance = balance - $1 WHERE balance >= $1`); (c) otimista por versão com retry limitado.
+- **Prós e contras:**
+  - (a) serializa só escritores da mesma carteira e deixa o domínio ver o saldo exato antes de decidir, o que dá rejeições limpas e auditáveis. Custo: escritores da mesma carteira entram em fila.
+  - (b) usa o mínimo de round-trips, mas o domínio não enxerga o saldo antes de decidir, e reversões (que leem a referência e escolhem a direção) ficam difíceis de manter consistentes.
+  - (c) não segura lock, mas sob contenção (50 apostas iguais, 2×80 em 100) gera muitos retries e pode esgotá-los, devolvendo erro ao cliente.
+- **Escolha e justificativa:** (a), uma combinação de pessimista com checagem otimista.
+  - `WalletRepository.Lock` faz `SELECT … FOR UPDATE` só na linha da carteira.
+  - `WalletRepository.Save` grava com `WHERE id = $1 AND version = $esperada`. Sob o lock essa condição nunca falha; se falhar (uma escrita sem lock), o resultado é `ErrConcurrentUpdate` e nada é confirmado.
+  - **Ordem de locks:** carteira primeiro. Operação e referência sempre pertencem à mesma carteira (a FK composta da referência garante isso), então duas reversões da mesma aposta são serializadas pelo mesmo lock, sem deadlock.
+  - **Nível de isolamento:** `READ COMMITTED`. A serialização vem do lock de linha, não do nível de isolamento.
+  - **`lock_timeout`:** `DB_LOCK_TIMEOUT`, padrão 5 s, aplicado por transação com `set_config(..., true)`. Uma espera maior resulta em `55P03`, classificado como transitório.
+  - As invariantes não dependem do lock: o banco as impõe sozinho (constraints e triggers abaixo).
+- **Critério impactado:** Concorrência e Integridade financeira.
+- **Como verificar:**
+  - `TestConcurrentDebitsDoNotLoseUpdates` (40 apostas paralelas na mesma carteira; saldo, versão e cadeia exatos).
+  - `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestSaveDetectsStaleVersion` e `TestLockTimeoutIsTransient`.
+  - Os mutantes "lock da carteira sem FOR UPDATE" e "UPDATE sem checar a versão".
+- **Limitações:** uma carteira muito disputada tem o throughput limitado à serialização dos seus escritores. Por enquanto só há testes com um processo; a prova com ≥ 3 processos fica para a Fase 10.
+
+#### D11. Acesso ao banco: pgx puro com UnitOfWork
+
+- **Contexto:** "`pgx` com SQL explícito é preferencial. […] Transações, locks e constraints devem permanecer explícitos e verificáveis." / "Onde a transação SQL é delimitada entre repositórios."
+- **Opções consideradas:** (a) pgx puro, com a transação entregue pela porta `UnitOfWork`; (b) pgx + sqlc; (c) pgx com a transação viajando no `context.Context`.
+- **Prós e contras:**
+  - (a) deixa SQL, locks e commit visíveis num único ponto.
+  - (b) dá tipagem gerada, mas acrescenta uma ferramenta, código gerado e mapeamento extra para o domínio.
+  - (c) tem menos parâmetros, mas cria uma dependência implícita: um repositório chamado sem a tx no contexto roda fora da transação sem aviso.
+- **Escolha e justificativa:** (a).
+  - A porta `app.UnitOfWork.Do(ctx, func(ctx, app.Tx) error)` abre uma `pgx.Tx`, entrega os repositórios ligados a ela e faz commit só se a função não devolver erro. Qualquer erro, ou a falha das conferências diferidas no commit, desfaz tudo.
+  - O rollback usa um contexto próprio, para ocorrer mesmo com o contexto da requisição cancelado.
+  - Os repositórios só existem dentro de uma `Tx`; não há como gravar fora da transação.
+- **Critério impactado:** Integridade financeira e Modelagem e arquitetura.
+- **Como verificar:** `TestUnitOfWorkRollsBackEverything` e `TestOpeningRoundTrip`.
+- **Limitações:** a classificação de erro depende de os repositórios traduzirem os erros do pgx (`errors.go`).
+
+#### Classificação de erros do banco (complemento da D7)
+
+`postgres.translate` converte erros do pgx para a camada de aplicação:
+
+| Origem | Classificação |
+|---|---|
+| `40001`, `40P01`, `55P03`, `57014`, `57P01`–`57P03`, classes `08` e `53`, erros de rede ou conexão, `context.DeadlineExceeded` | `app.ErrTransient` (nada confirmado; pode repetir) |
+| `23505` em `wallets_player_currency_key` | `WALLET_ALREADY_EXISTS` |
+| outros `23505` | `app.DuplicateError{Constraint}`; o caso de uso decide (ex.: reler e devolver o replay) |
+| outros `23xxx` (CHECK, FK, triggers) | `INCONSISTENT_STATE`: o código tentou gravar algo que viola uma invariante |
+| `pgx.ErrNoRows` | `app.ErrNotFound` |
+
+`app.IsRetryable` é verdadeiro para `ErrTransient` e `ErrConcurrentUpdate`.
+
+**Como verificar:** `TestLockTimeoutIsTransient`, `TestIdempotencyConstraints`, `TestOneWalletPerPlayerAndCurrency` e o mutante "lock_timeout não classificado como transitório".
+
+#### Aplicação das migrations: serviço one-shot no Compose
+
+- **Contexto:** "Aplicação e reversão das migrations" (README) / "Execução reproduzível a partir de checkout limpo".
+- **Opções consideradas:** (a) serviço `migrate` no Compose, que roda `goose up` e termina; (b) migrations aplicadas na partida da aplicação; (c) somente manual.
+- **Prós e contras:**
+  - (a) não exige privilégio de DDL na aplicação, e várias instâncias não disputam a migration.
+  - (b) exige DDL na aplicação e um lock para que 3 ou mais instâncias não apliquem ao mesmo tempo.
+  - (c) quebra o `docker compose up --build` a partir de checkout limpo.
+- **Escolha e justificativa:** (a). A aplicação depende de `migrate` com `service_completed_successfully`, e a reversão é feita com `goose down` ou `goose down-to 0` pelo container `tools`.
+- **Como verificar:** `docker compose up --build` a partir de volume vazio (o `migrate` termina com código 0 e a readiness responde ok) e `TestMigrationsApplyRevertAndReapply`.
+- **Limitações:** as migrations são escritas para avançar; dados gravados não sobrevivem a um `down` das tabelas.
+
+#### Proteção do ledger: triggers + papéis separados
+
+- **Contexto:** "No banco: unicidade de `(walletId, transactionId)` e proteção contra edição ou exclusão." / "Unicidade, não negatividade e imutabilidade do ledger impostas por schema, constraints e mecanismos de proteção do banco."
+- **Opções consideradas:** (a) triggers e papéis separados; (b) somente triggers; (c) somente privilégios.
+- **Prós e contras:**
+  - (a) cria duas barreiras independentes.
+  - (b) ainda deixa o dono do schema, que também seria a aplicação, desabilitar o trigger.
+  - (c) não protege contra o dono do schema.
+- **Escolha e justificativa:** (a).
+  - `wallet_owner` é o dono do schema e só é usado pelas migrations.
+  - `wallet_app` é o papel da aplicação: tem só `SELECT` e `INSERT` no ledger, e nenhum `DELETE` em tabela alguma.
+  - Triggers `BEFORE UPDATE/DELETE/TRUNCATE` barram alterações no ledger também para o dono.
+  - Carteiras, transações e eventos da outbox também não podem ser apagados.
+- **Critério impactado:** Integridade financeira.
+- **Como verificar:** `TestLedgerIsAppendOnly` (privilégio negado para `wallet_app`; trigger para `wallet_owner`), `TestWalletsAndTransactionsCannotBeDeleted` e os mutantes "aplicação pode alterar e apagar o ledger" e "dono do schema pode apagar lançamento".
+- **Limitações:** um superusuário ou o dono do schema ainda pode desabilitar triggers deliberadamente. A proteção é contra erro e uso indevido da aplicação, não contra um administrador mal-intencionado.
+
+#### Saldo × ledger: versão no lançamento + conferência diferida
+
+- **Contexto:** "Toda mudança financeira exige o lançamento correspondente no ledger, confirmado junto com o saldo." / "Invariantes financeiras garantidas no banco, independentemente de locks locais."
+- **Opções consideradas:** (a) `wallet_version` no lançamento, `UNIQUE (wallet_id, wallet_version)` e constraint trigger diferido; (b) só aplicação (UnitOfWork) mais reconciliação posterior.
+- **Prós e contras:**
+  - (a) faz o banco recusar no commit um saldo sem o lançamento correspondente.
+  - (b) é mais simples, mas um bug ou um UPDATE manual cria uma divergência que o banco aceita e que só a reconciliação detecta depois.
+- **Escolha e justificativa:** (a), em três camadas:
+  1. **CHECKs do lançamento:** `balance_after = balance_before ± amount`, valor > 0, saldos ≥ 0. A moeda do lançamento é a da carteira e a da transação (FKs compostas), e o lançamento pertence à carteira da transação.
+  2. **Trigger `BEFORE INSERT` de cadeia:** o primeiro lançamento parte de saldo 0 (versão 1, ou 2 se a carteira foi aberta com zero); cada seguinte continua exatamente do anterior. O valor é o da transação, `LOSS` nunca gera lançamento, e a direção é coerente com o tipo (`BET` debita; `OPENING`, `WIN` e `REFUND` creditam).
+  3. **Constraint trigger `DEFERRABLE INITIALLY DEFERRED`** em `wallets` e no ledger: no COMMIT, o saldo e a versão de cada carteira tocada são os do seu último lançamento (ou zero na versão 1, sem lançamento). O trigger lê o estado atual da linha, porque a carteira pode mudar várias vezes na mesma transação.
+  
+  Em `wallets`, um trigger exige versão +1 exatamente quando o saldo muda, e versão inalterada quando não muda.
+- **Critério impactado:** Integridade financeira.
+- **Como verificar:** `TestBalanceChangeRequiresLedgerEntry`, `TestLedgerChainIsEnforced`, `TestWalletVersionRules`, `TestBalanceCannotBeNegative` e os mutantes "saldo confirmado sem lançamento", "cadeia do ledger não conferida", "banco aceita versão sem mudança de saldo" e "banco aceita saldo negativo".
+- **Limitações:** o banco não confere que o estado da transação é `PROCESSED` quando o lançamento é gravado (a ordem das gravações é responsabilidade da UnitOfWork). O custo é uma consulta indexada por carteira em cada lançamento e no commit.
+
+#### Máquina de estados também no banco
+
+- **Contexto:** "Transação terminal não sofre novas transições. Replay consulta o resultado persistido sem reaplicar."
+- **Opções consideradas:** (a) trigger de transição; (b) só no domínio.
+- **Prós e contras:**
+  - (a) impede que um UPDATE direto reabra ou altere uma transação concluída, o que corromperia o replay.
+  - (b) é mais simples, mas depende só do código Go.
+- **Escolha e justificativa:** (a). Trigger `BEFORE UPDATE/DELETE/TRUNCATE` em `wager_transactions`:
+  - linha terminal não muda;
+  - só valem as transições do §4.5;
+  - identidade, valor, carteira, provedor, chave, hash, rodada, jogo e referência externa são imutáveis.
+  
+  CHECKs espelham as regras do domínio: operação interna vs. externa, zero só em `LOSS`, referência obrigatória em reversões e proibida em `BET`/`LOSS`, resultado coerente com o estado, e `failureCode` restrito ao catálogo (§4.9) conforme o estado.
+- **Critério impactado:** Integridade financeira e Idempotência.
+- **Como verificar:** `TestTransactionStateMachineInDatabase` e `TestDatabaseEnforcesDomainRules` (12 violações recusadas), e os mutantes "transação volta para PENDING" e "banco aceita código de falha desconhecido".
+- **Limitações:** a lista de códigos e de moedas é duplicada entre o domínio e as constraints; um código novo exige uma migration.
+
+#### Unicidade imposta pelo banco
+
+| Índice ou constraint | Garantia |
+|---|---|
+| `wallets_player_currency_key` | uma carteira por `(playerId, currency)` |
+| `wager_transactions_provider_key_uq` | idempotência por `(providerId, idempotencyKey)` |
+| `wager_transactions_provider_external_uq` | a operação `(providerId, externalTransactionId)` não pode ser registrada com outra chave |
+| `wager_transactions_opening_uq` | no máximo um `OPENING` (crédito inicial) por carteira |
+| `wager_transactions_one_reversal_uq` | no máximo uma reversão `PROCESSED` por transação referenciada (D5) |
+| `wallet_ledger_entries_wallet_transaction_key` | um lançamento por `(walletId, transactionId)` |
+| `wallet_ledger_entries_wallet_version_key` | uma versão por carteira (cadeia sem bifurcação) |
+| `inbox_messages_pkey` | uma mensagem por `(consumerName, messageId)` |
+
+**Como verificar:** `TestIdempotencyConstraints`, `TestOneSuccessfulReversalPerReference` (um caso de uso com bug que ignora a reversão existente é barrado pelo índice) e `TestOneWalletPerPlayerAndCurrency`.
+
+#### Representação de tipos e estados: `TEXT` + `CHECK`
+
+- **Opções consideradas:** (a) `TEXT` com `CHECK (… IN (…))`; (b) `ENUM` do PostgreSQL.
+- **Prós e contras:**
+  - (a) evolui trocando a constraint numa migration reversível, e o valor lê igual ao domínio.
+  - (b) é compacto, mas um valor de enum não pode ser removido, o que impede um `down` limpo.
+- **Escolha:** (a).
+
+#### Outbox e inbox
+
+- **Payload da outbox:** coluna `json`, não `jsonb`. `json` preserva o texto exatamente como gerado por `event.Marshal`, então o evento republicado é byte a byte igual ao original. `jsonb` reordena chaves e normaliza o texto; `bytea` seria opaco para diagnóstico.
+- **Imutabilidade do snapshot:** trigger impede alterar `event_id`, agregado, tipo, payload e ocorrência; depois de publicado, o evento não volta a pendente. Eventos não são apagados.
+- **Colunas de retry:** `attempts`, `next_attempt_at` e `last_error`. O índice parcial de pendentes é `published_at IS NULL`.
+- **Inbox:** `(consumer_name, message_id)` como chave, mais `payload_hash`, `received_at` e `completed_at`. A conclusão é registrada uma única vez (trigger), e `Register` com `ON CONFLICT DO NOTHING` devolve o registro existente em reentregas.
+- **Como verificar:** `TestOpeningRoundTrip` (payload igual a `event.Marshal`), `TestOutboxSnapshotIsImmutable`, `TestInboxDeduplicates` e o mutante "payload da outbox pode mudar".
+- **Pendente:** campos de disputa entre publishers e de recuperação de trabalho abandonado (Fase 8, D10).
+
+#### Banco dos testes de integração: temporário por pacote
+
+- **Contexto:** "Integração (containers reais: PostgreSQL […] — sem substituir toda a infraestrutura por mocks)."
+- **Opções consideradas:** (a) banco temporário por pacote; (b) banco fixo `wallet_test`; (c) o mesmo banco da aplicação.
+- **Prós e contras:**
+  - (a) isola dos dados da aplicação e entre pacotes, e permite testar `down`/`up` num banco próprio.
+  - (b) acumula dados entre execuções, porque o ledger não pode ser apagado, e o `down`/`up` competiria com os demais testes.
+  - (c) polui o banco da aplicação e derrubaria a aplicação em execução no `down`.
+- **Escolha e justificativa:** (a). O `TestMain` cria `wallet_test_<aleatório>` como `wallet_owner` (que tem `CREATEDB`), aplica as migrations com o `goose` como biblioteca, roda os testes com o papel real `wallet_app` e apaga o banco ao final.
+- **Como verificar:**
+```bash
+docker compose run --rm tools go test -race -tags=integration ./internal/adapters/postgres/...
+```
+- **Limitações:** exige o PostgreSQL do Compose no ar. O `goose` como biblioteca traz dependências transitivas de outros drivers para o `go.mod`, usadas apenas pelos testes.
+
+### 4.12 Decisões pendentes
 
 | # | Decisão | Fase |
 |---|---|---|
-| D1 | Estratégia de concorrência por carteira | 4 |
-| D11 | Biblioteca de acesso ao banco e delimitação de transação | 4 |
 | D4 | Tentativas, TTL e backoff de `PENDING_REFERENCE` | 5 |
 | D14 | Aceite síncrono ou assíncrono | 5 |
 | D6 | Mapeamento de códigos para HTTP | 5/6 |
@@ -456,7 +623,7 @@ Também valem estas regras:
 | D9 | `MessageGroupId`, deduplicação, visibility timeout, `maxReceiveCount`, mensagens inválidas | 7 |
 | D10 | Destino dos eventos e contrato de roteamento | 8 |
 
-### 4.12 Composição com Fx e ciclo de vida (parcial)
+### 4.13 Composição com Fx e ciclo de vida (parcial)
 
 - **Contexto:** "Fx compõe configuração, conexões, repositórios, casos de uso, handlers e workers […] fechamento das dependências depois dos componentes que as utilizam."
 - **Implementado até aqui:**
@@ -469,7 +636,7 @@ Também valem estas regras:
 - **Como verificar:** hoje, de forma manual: `docker compose stop app` mostra no log o hook do servidor executando antes do hook do pool. O teste automatizado da composição Fx será feito na Fase 10.
 - **Pendente:** workers (consumidor, publisher, referências) e o shutdown seguro do consumidor SQS.
 
-### 4.13 Ambiente, ferramentas e testes
+### 4.14 Ambiente, ferramentas e testes
 
 #### Toolchain sem instalação local
 
@@ -504,8 +671,8 @@ Também valem estas regras:
   - (a) usa arquivos SQL com `Up` e `Down` no mesmo arquivo, CLI no container e pode ser usado como biblioteca nos testes.
   - (b) é muito difundido, mas usado como biblioteca nos testes puxa mais dependências de drivers.
 - **Escolha e justificativa:** (a), `v3.29.0`, instalado na imagem `tools`.
-- **Como verificar:** na Fase 4 (aplicar, reverter e reaplicar).
-- **Limitações:** a forma de aplicação (serviço no Compose ou na partida da app) será decidida na Fase 4.
+- **Como verificar:** `TestMigrationsApplyRevertAndReapply` e os comandos `goose` do README.
+- **Limitações:** a forma de aplicação está descrita no §4.11 (serviço one-shot).
 
 #### D13. Build tags
 
@@ -541,7 +708,7 @@ Também valem estas regras:
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 27 mutantes mortos e 0 problemas.
+- **Como verificar:** o comando abaixo, que hoje dá 45 mutantes mortos e 0 problemas (28 de domínio e 17 de persistência, estes com o PostgreSQL no ar).
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
@@ -559,12 +726,12 @@ docker compose run --rm tools bash scripts/mutation.sh
 
 | Critério | Pontos | Evidência atual | Pendente |
 |---|---|---|---|
-| Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8) | constraints e triggers no banco; reconciliação |
-| Concorrência | 20 | — | D1; testes com ≥ 3 processos |
-| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7) | persistência e unicidade; replay HTTP/SQS |
-| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8) | inbox, outbox, retries, DLQ, shutdown |
-| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; módulos Fx (§1.2, §4.3, §4.12) | autenticação e autorização |
-| Testes | 10 | 78 testes unitários com `-race`; 27/27 mutantes mortos (§4.13) | integração, isolamento entre provedores, paralelismo, interrupção |
+| Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8). No banco: saldo ≥ 0, ledger append-only (privilégio + trigger), cadeia do ledger e conferência saldo × ledger no commit, máquina de estados e regras dos tipos (§4.11) | reconciliação |
+| Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11) | testes com ≥ 3 processos |
+| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`) | fluxo de replay nos casos de uso; HTTP × SQS |
+| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11) | consumidor, publisher, retries, DLQ, shutdown |
+| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.13) | autenticação e autorização |
+| Testes | 10 | testes unitários e 24 testes de integração com PostgreSQL real, todos com `-race`; 45/45 mutantes mortos, incluindo 17 de SQL e repositórios (§4.14) | isolamento entre provedores na API, paralelismo multiprocesso, interrupção |
 | Observabilidade | 5 | logs JSON; `/health/live`; `/health/ready` com PostgreSQL e SQS | IDs nos logs; métricas |
 | Documentação | 5 | este documento e o README | revisão final |
 
@@ -575,20 +742,22 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Garantia | Estado | Evidência |
 |---|---|---|
 | Dinheiro nunca passa por `float32`/`float64` | ✅ | `TestNoFloatingPointInProductionCode`; parsing estrito; JSON numérico rejeitado |
-| Idempotência persistente, sobrevive ao reinício | pendente | Fases 4, 5 e 10 |
-| Invariantes financeiras garantidas no banco | pendente | Fase 4 |
-| Eventos externos publicados só após o commit | pendente | Fase 8 |
-| Ledger append-only; correções por novos lançamentos | parcial | `LedgerEntry` imutável no domínio; proteção no banco na Fase 4 |
-| Carteiras independentes em paralelo; nenhum lock global | pendente | D1, Fase 4 |
-| Sem lost updates no saldo | pendente | D1, Fases 4 e 10 |
-| Unicidade, não negatividade e imutabilidade impostas pelo banco | pendente | Fase 4 |
+| Idempotência persistente, sobrevive ao reinício | parcial | chave, hash e resultado persistidos com unicidade no banco (§4.11); fluxo de replay e reinício nas Fases 5 e 10 |
+| Invariantes financeiras garantidas no banco | ✅ | §4.11: CHECKs, triggers de cadeia, de versão e de estado, conferência diferida saldo × ledger; `TestBalanceChangeRequiresLedgerEntry`, `TestDatabaseEnforcesDomainRules` |
+| Eventos externos publicados só após o commit | pendente | Fase 8 (a outbox já é gravada no mesmo commit: `TestUnitOfWorkRollsBackEverything`) |
+| Ledger append-only; correções por novos lançamentos | ✅ | privilégio só `SELECT`/`INSERT` para a aplicação e triggers contra `UPDATE`/`DELETE`/`TRUNCATE`; `TestLedgerIsAppendOnly` |
+| Carteiras independentes em paralelo; nenhum lock global | ✅ (um processo) | lock só na linha da carteira; `TestIndependentWalletsDoNotBlock`. Multiprocesso na Fase 10 |
+| Sem lost updates no saldo | ✅ (um processo) | `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`. Multiprocesso na Fase 10 |
+| Unicidade, não negatividade e imutabilidade impostas pelo banco | ✅ | índices únicos, `CHECK (balance_minor >= 0)` e triggers (§4.11) |
 | Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | pendente | Fase 10 |
 
 ---
 
 ## 7. Limitações e trabalho não concluído
 
-- Persistência, casos de uso, HTTP, autenticação, SQS, outbox, workers e métricas ainda não foram implementados (ver §2).
-- As decisões D1, D4, D6 (parte HTTP), D8, D9, D10, D11 e D14 estão pendentes (§4.11).
+- Casos de uso, HTTP, autenticação, consumidor SQS, publisher da outbox, workers e métricas ainda não foram implementados (ver §2).
+- As decisões D4, D6 (parte HTTP), D8, D9, D10 e D14 estão pendentes (§4.12).
+- A concorrência só foi demonstrada com um processo; a prova com ≥ 3 processos independentes fica para a Fase 10.
+- O banco não confere que a transação está `PROCESSED` quando o seu lançamento é gravado (§4.11).
 - Moedas limitadas a BRL, USD e EUR, todas com 2 casas decimais.
 - LocalStack fixado na linha comunitária `4.14.0`, que não recebe novas correções.

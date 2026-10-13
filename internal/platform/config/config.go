@@ -25,6 +25,7 @@ type Config struct {
 	HTTPReadTimeout   time.Duration
 	HTTPWriteTimeout  time.Duration
 	HTTPHeaderTimeout time.Duration
+	DBLockTimeout     time.Duration
 }
 
 // Load lê o ambiente e devolve um Config validado.
@@ -51,6 +52,7 @@ func Load() (Config, error) {
 	cfg.ReadinessTimeout = durationOr("READINESS_TIMEOUT", 2*time.Second, &errs)
 	cfg.HTTPReadTimeout = durationOr("HTTP_READ_TIMEOUT", 10*time.Second, &errs)
 	cfg.HTTPWriteTimeout = durationOr("HTTP_WRITE_TIMEOUT", 15*time.Second, &errs)
+	cfg.DBLockTimeout = durationOr("DB_LOCK_TIMEOUT", 5*time.Second, &errs)
 	cfg.HTTPHeaderTimeout = durationOr("HTTP_READ_HEADER_TIMEOUT", 5*time.Second, &errs)
 
 	if err := errors.Join(errs...); err != nil {
