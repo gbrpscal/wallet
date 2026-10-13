@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,4 +86,24 @@ func ledgerEntryOf(id, walletID, txID, direction, currency string, amount, befor
 		return wallet.LedgerEntry{}, inconsistent("ledger balance", err)
 	}
 	return wallet.NewLedgerEntry(s)
+}
+
+// Totals soma no banco (NUMERIC, sem overflow intermediário) e devolve o
+// resultado como texto, convertido para int64 com checagem de faixa.
+func (r ledgerRepo) Totals(ctx context.Context, walletID domain.WalletID) (int64, int, error) {
+	var net string
+	var count int
+	err := r.q.QueryRow(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount_minor::numeric
+		                         ELSE -amount_minor::numeric END), 0)::text,
+		       count(*)
+		FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID.String()).Scan(&net, &count)
+	if err != nil {
+		return 0, 0, translate(err)
+	}
+	minor, err := strconv.ParseInt(net, 10, 64)
+	if err != nil {
+		return 0, 0, inconsistent("ledger total", err)
+	}
+	return minor, count, nil
 }

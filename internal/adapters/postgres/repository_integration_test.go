@@ -134,7 +134,7 @@ func TestIdempotencyConstraints(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return tx.Transactions().Insert(ctx, wtx)
+			return tx.Transactions().Insert(ctx, wtx, app.TransactionMeta{Trace: trace})
 		})
 	}
 	sameKey := operation(t, out.Wallet, "provider-a", "idem-1", "BET", "2.00", "")
@@ -183,7 +183,7 @@ func TestOneSuccessfulReversalPerReference(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := tx.Transactions().Insert(ctx, res.Transaction); err != nil {
+		if err := tx.Transactions().Insert(ctx, res.Transaction, app.TransactionMeta{Trace: trace}); err != nil {
 			return err
 		}
 		if err := tx.Ledger().Append(ctx, *res.Entry); err != nil {

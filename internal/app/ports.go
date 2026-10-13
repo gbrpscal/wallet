@@ -16,6 +16,9 @@ import (
 // ErrDuplicate, ErrNotFound ou *domain.Error).
 type UnitOfWork interface {
 	Do(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error
+	// View executa fn numa transação REPEATABLE READ somente leitura: todas
+	// as leituras enxergam o mesmo snapshot, e nenhuma escrita é aceita.
+	View(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error
 }
 
 // Tx dá acesso aos repositórios ligados à transação em andamento.
@@ -45,15 +48,49 @@ type WalletRepository interface {
 // TransactionRepository persiste transações de wagering. Toda busca externa é
 // escopada pelo provedor.
 type TransactionRepository interface {
-	Insert(ctx context.Context, t *wagering.WagerTransaction) error
+	// Insert grava a transação com o rastreio da requisição de origem e, se
+	// ela estiver em PENDING_REFERENCE, com o agendamento da próxima tentativa.
+	Insert(ctx context.Context, t *wagering.WagerTransaction, meta TransactionMeta) error
 	// Save grava estado, resultado e referência resolvida, desde que o estado
 	// persistido ainda seja previous; caso contrário, ErrConcurrentUpdate.
-	Save(ctx context.Context, t *wagering.WagerTransaction, previous wagering.Status) error
+	// schedule só é informado quando a transação continua esperando.
+	Save(ctx context.Context, t *wagering.WagerTransaction, previous wagering.Status, schedule *ReferenceSchedule) error
 	Get(ctx context.Context, id domain.TransactionID) (*wagering.WagerTransaction, error)
 	FindByIdempotencyKey(ctx context.Context, providerID, key string) (*wagering.WagerTransaction, error)
 	FindByExternalID(ctx context.Context, providerID, externalID string) (*wagering.WagerTransaction, error)
 	// HasProcessedReversal informa se alguma reversão PROCESSED já aponta para id.
 	HasProcessedReversal(ctx context.Context, id domain.TransactionID) (bool, error)
+	// LockPending lê com FOR UPDATE uma transação em espera, com o rastreio e
+	// o agendamento persistidos. Deve ser chamado depois do lock da carteira.
+	LockPending(ctx context.Context, id domain.TransactionID) (*wagering.WagerTransaction, PendingInfo, error)
+	// DuePendingReferences lista, sem lock, as transações em PENDING_REFERENCE
+	// cuja próxima tentativa já venceu, das mais antigas para as mais novas.
+	DuePendingReferences(ctx context.Context, now time.Time, limit int) ([]PendingReference, error)
+}
+
+// TransactionMeta acompanha a gravação de uma transação.
+type TransactionMeta struct {
+	Trace    event.Trace
+	Schedule *ReferenceSchedule
+}
+
+// ReferenceSchedule é o agendamento durável da espera por referência.
+type ReferenceSchedule struct {
+	Attempts      int
+	NextAttemptAt time.Time
+	ExpiresAt     time.Time
+}
+
+// PendingInfo é o que foi persistido junto com uma transação em espera.
+type PendingInfo struct {
+	Trace    event.Trace
+	Schedule ReferenceSchedule
+}
+
+// PendingReference identifica uma transação esperando referência.
+type PendingReference struct {
+	TransactionID domain.TransactionID
+	WalletID      domain.WalletID
 }
 
 // LedgerRepository acrescenta e lê lançamentos; não há alteração nem remoção.
@@ -62,6 +99,9 @@ type LedgerRepository interface {
 	// List devolve até limit lançamentos com versão maior que afterVersion,
 	// em ordem crescente de versão.
 	List(ctx context.Context, walletID domain.WalletID, afterVersion int64, limit int) ([]wallet.LedgerEntry, error)
+	// Totals soma créditos − débitos de todos os lançamentos da carteira, em
+	// unidades mínimas, e conta os lançamentos.
+	Totals(ctx context.Context, walletID domain.WalletID) (netMinor int64, entries int, err error)
 }
 
 // OutboxRepository grava eventos para publicação posterior ao commit.

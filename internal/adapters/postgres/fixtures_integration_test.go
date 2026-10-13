@@ -63,7 +63,7 @@ func persistOpening(ctx context.Context, tx app.Tx, out wagering.OpenOutcome) er
 		return err
 	}
 	if out.Opening != nil {
-		if err := tx.Transactions().Insert(ctx, out.Opening); err != nil {
+		if err := tx.Transactions().Insert(ctx, out.Opening, app.TransactionMeta{Trace: trace}); err != nil {
 			return err
 		}
 		if err := tx.Ledger().Append(ctx, *out.Entry); err != nil {
@@ -126,7 +126,12 @@ func processNew(ctx context.Context, tx app.Tx, req wagering.Request) (wagering.
 	if err != nil {
 		return wagering.Outcome{}, err
 	}
-	if err := tx.Transactions().Insert(ctx, out.Transaction); err != nil {
+	meta := app.TransactionMeta{Trace: trace}
+	if out.Transaction.Status() == wagering.PendingReference {
+		sched := app.DefaultReferencePolicy.Initial(out.Transaction.CreatedAt())
+		meta.Schedule = &sched
+	}
+	if err := tx.Transactions().Insert(ctx, out.Transaction, meta); err != nil {
 		return wagering.Outcome{}, err
 	}
 	if out.Entry != nil {

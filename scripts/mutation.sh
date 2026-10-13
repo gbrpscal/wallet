@@ -190,6 +190,37 @@ mutate "lock_timeout não aplicado" internal/adapters/postgres/uow.go \
 mutate "busca de replay sem escopo de provedor" internal/adapters/postgres/transactions.go \
   'WHERE provider_id = $1 AND idempotency_key = $2' 'WHERE $1::text IS NOT NULL AND idempotency_key = $2' $PG integration
 
+# --- Casos de uso (tag integration; exige o PostgreSQL no ar) --------------------
+APP=./internal/app/...
+baseline $APP integration
+
+mutate "replay não confere o payload" internal/app/service.go \
+  'if err := existing.CheckReplay(req); err != nil {' 'if false {' $APP integration
+mutate "carteira inexistente sem WALLET_NOT_FOUND" internal/app/service.go \
+  'return OperationResult{}, domain.Errorf(domain.ErrWalletNotFound, "wallet %s not found", req.WalletID())' 'return OperationResult{}, err' $APP integration
+mutate "pendência gravada sem agendamento" internal/app/service.go \
+  'meta.Schedule = &sched' '_ = sched' $APP integration
+mutate "worker ignora o horário agendado" internal/app/service.go \
+  '|| now.Before(info.Schedule.NextAttemptAt) {' '{' $APP integration
+mutate "reversão anterior ignorada" internal/app/service.go \
+  'return wagering.Reference{Transaction: r, Reversed: reversed}, nil' 'return wagering.Reference{Transaction: r, Reversed: false && reversed}, nil' $APP integration
+mutate "reconciliação sempre consistente" internal/app/service.go \
+  'Consistent: diff.IsZero(),' 'Consistent: true,' $APP integration
+mutate "cursor repete o último lançamento" internal/app/service.go \
+  'EncodeCursor(entries[limit-1].WalletVersion())' 'EncodeCursor(entries[limit-1].WalletVersion() - 1)' $APP integration
+mutate "espera não respeita o máximo de tentativas" internal/app/policy.go \
+  'return s.Attempts >= p.MaxAttempts ||' 'return s.Attempts > p.MaxAttempts ||' $APP integration
+mutate "espera ignora o TTL" internal/app/policy.go \
+  '|| !now.Before(s.ExpiresAt)' '|| false' $APP integration
+mutate "backoff sem teto" internal/app/policy.go \
+  'if d > p.MaxDelay {
+		d = p.MaxDelay
+	}' '' $APP
+mutate "retry não repete falha transitória" internal/app/policy.go \
+  'return IsRetryable(err) || errors.Is(err, ErrDuplicate)' 'return errors.Is(err, ErrDuplicate)' $APP
+mutate "cursor aceita versão negativa" internal/app/policy.go \
+  '|| c.V != 1 || c.After < 0 {' '|| c.V != 1 {' $APP
+
 echo
 echo "mutantes mortos: $killed, problemas: $bad"
 [ "$bad" -eq 0 ]

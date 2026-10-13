@@ -20,6 +20,9 @@ const (
 	// KindInvariant indica que o estado persistido ou em memória viola uma
 	// invariante. Nunca é causado por entrada do cliente.
 	KindInvariant
+	// KindNotFound indica que o recurso referenciado pela requisição não existe.
+	// Nada é persistido.
+	KindNotFound
 )
 
 func (k ErrorKind) String() string {
@@ -32,6 +35,8 @@ func (k ErrorKind) String() string {
 		return "rejection"
 	case KindInvariant:
 		return "invariant"
+	case KindNotFound:
+		return "not_found"
 	default:
 		return "unknown"
 	}
@@ -64,6 +69,8 @@ const (
 	CodeAlreadyReversed        Code = "ALREADY_REVERSED"
 	CodeInconsistentState      Code = "INCONSISTENT_STATE"
 	CodeInvalidTransition      Code = "INVALID_STATE_TRANSITION"
+	CodeWalletNotFound         Code = "WALLET_NOT_FOUND"
+	CodeTransactionNotFound    Code = "TRANSACTION_NOT_FOUND"
 )
 
 // Error é o único tipo de erro do domínio. Dois erros casam com errors.Is
@@ -115,6 +122,8 @@ var (
 	ErrAlreadyReversed        = &Error{Kind: KindRejection, Code: CodeAlreadyReversed}
 	ErrInconsistentState      = &Error{Kind: KindInvariant, Code: CodeInconsistentState}
 	ErrInvalidTransition      = &Error{Kind: KindInvariant, Code: CodeInvalidTransition}
+	ErrWalletNotFound         = &Error{Kind: KindNotFound, Code: CodeWalletNotFound}
+	ErrTransactionNotFound    = &Error{Kind: KindNotFound, Code: CodeTransactionNotFound}
 )
 
 var byCode = func() map[Code]*Error {
@@ -125,7 +134,7 @@ var byCode = func() map[Code]*Error {
 		ErrExternalTxConflict, ErrWalletAlreadyExists, ErrInsufficientFunds, ErrReversalInsufficient,
 		ErrCurrencyMismatch, ErrWalletPlayerMismatch, ErrReferenceNotFound, ErrReferenceNotProcessed,
 		ErrReferenceMismatch, ErrReferenceAmount, ErrReferenceNotReversible, ErrAlreadyReversed,
-		ErrInconsistentState, ErrInvalidTransition,
+		ErrInconsistentState, ErrInvalidTransition, ErrWalletNotFound, ErrTransactionNotFound,
 	} {
 		m[e.Code] = e
 	}

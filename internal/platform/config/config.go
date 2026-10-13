@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -26,6 +27,11 @@ type Config struct {
 	HTTPWriteTimeout  time.Duration
 	HTTPHeaderTimeout time.Duration
 	DBLockTimeout     time.Duration
+	// Espera por referência (D4).
+	ReferenceMaxAttempts int
+	ReferenceTTL         time.Duration
+	ReferenceBaseDelay   time.Duration
+	ReferenceMaxDelay    time.Duration
 }
 
 // Load lê o ambiente e devolve um Config validado.
@@ -53,6 +59,13 @@ func Load() (Config, error) {
 	cfg.HTTPReadTimeout = durationOr("HTTP_READ_TIMEOUT", 10*time.Second, &errs)
 	cfg.HTTPWriteTimeout = durationOr("HTTP_WRITE_TIMEOUT", 15*time.Second, &errs)
 	cfg.DBLockTimeout = durationOr("DB_LOCK_TIMEOUT", 5*time.Second, &errs)
+	cfg.ReferenceMaxAttempts = intOr("REFERENCE_MAX_ATTEMPTS", 10, &errs)
+	cfg.ReferenceTTL = durationOr("REFERENCE_TTL", 10*time.Minute, &errs)
+	cfg.ReferenceBaseDelay = durationOr("REFERENCE_BACKOFF_BASE", time.Second, &errs)
+	cfg.ReferenceMaxDelay = durationOr("REFERENCE_BACKOFF_MAX", time.Minute, &errs)
+	if cfg.ReferenceBaseDelay > cfg.ReferenceMaxDelay {
+		errs = append(errs, errors.New("REFERENCE_BACKOFF_BASE must not exceed REFERENCE_BACKOFF_MAX"))
+	}
 	cfg.HTTPHeaderTimeout = durationOr("HTTP_READ_HEADER_TIMEOUT", 5*time.Second, &errs)
 
 	if err := errors.Join(errs...); err != nil {
@@ -83,4 +96,17 @@ func durationOr(key string, fallback time.Duration, errs *[]error) time.Duration
 		return 0
 	}
 	return d
+}
+
+func intOr(key string, fallback int, errs *[]error) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		*errs = append(*errs, fmt.Errorf("%s must be a positive integer", key))
+		return 0
+	}
+	return n
 }

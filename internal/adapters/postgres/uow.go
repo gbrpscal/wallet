@@ -30,8 +30,18 @@ func NewUnitOfWork(pool *pgxpool.Pool, lockTimeout time.Duration) *UnitOfWork {
 // Do executa fn em uma transação. Commit só acontece se fn não devolver erro;
 // as conferências diferidas do banco (saldo x ledger) rodam no commit e, se
 // falharem, nada é confirmado.
-func (u *UnitOfWork) Do(ctx context.Context, fn func(ctx context.Context, tx app.Tx) error) (err error) {
-	tx, err := u.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+func (u *UnitOfWork) Do(ctx context.Context, fn func(ctx context.Context, tx app.Tx) error) error {
+	return u.run(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
+}
+
+// View executa fn numa transação REPEATABLE READ READ ONLY: um único snapshot
+// para todas as leituras, sem bloquear escritores e sem aceitar escritas.
+func (u *UnitOfWork) View(ctx context.Context, fn func(ctx context.Context, tx app.Tx) error) error {
+	return u.run(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, fn)
+}
+
+func (u *UnitOfWork) run(ctx context.Context, opts pgx.TxOptions, fn func(ctx context.Context, tx app.Tx) error) (err error) {
+	tx, err := u.pool.BeginTx(ctx, opts)
 	if err != nil {
 		return translate(err)
 	}

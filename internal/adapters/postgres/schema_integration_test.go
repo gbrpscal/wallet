@@ -12,6 +12,7 @@ import (
 	"github.com/pressly/goose/v3"
 
 	"github.com/gbrpscal/wallet/internal/domain"
+	"github.com/gbrpscal/wallet/internal/testutil/pgtest"
 )
 
 func countTables(t *testing.T, ctx context.Context, dsn string) int {
@@ -37,12 +38,12 @@ func countTables(t *testing.T, ctx context.Context, dsn string) int {
 func TestMigrationsApplyRevertAndReapply(t *testing.T) {
 	ctx := context.Background()
 	ownerURL := os.Getenv("DATABASE_OWNER_URL")
-	name, err := createDatabase(ctx, ownerURL)
+	name, err := pgtest.CreateDatabase(ctx, ownerURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dropDatabase(ownerURL, name)
-	dsn := withDatabase(ownerURL, name)
+	defer pgtest.DropDatabase(ownerURL, name)
+	dsn := pgtest.WithDatabase(ownerURL, name)
 
 	steps := []struct {
 		name   string
@@ -54,7 +55,7 @@ func TestMigrationsApplyRevertAndReapply(t *testing.T) {
 		{"up again", func(p *goose.Provider) error { _, err := p.Up(ctx); return err }, 5},
 	}
 	for _, s := range steps {
-		if err := migrate(ctx, dsn, s.run); err != nil {
+		if err := pgtest.Migrate(ctx, dsn, s.run); err != nil {
 			t.Fatalf("%s: %v", s.name, err)
 		}
 		if got := countTables(t, ctx, dsn); got != s.tables {
@@ -219,9 +220,9 @@ func mustProcessPending(t *testing.T, w interface {
 	err := appPool.QueryRow(context.Background(), `
 		INSERT INTO wager_transactions (id, kind, wallet_id, player_id, amount_minor, currency, status,
 			provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
-			created_at, updated_at)
+			created_at, updated_at, correlation_id)
 		VALUES (gen_random_uuid(), 'BET', $1, $2, 1000, 'BRL', 'PENDING', 'provider-a', $3, $4,
-			'v1:0000000000000000000000000000000000000000000000000000000000000000', 'round-1', 'game-1', now(), now())
+			'v1:0000000000000000000000000000000000000000000000000000000000000000', 'round-1', 'game-1', now(), now(), 'schema-test')
 		RETURNING id::text`, w.ID().String(), w.PlayerID().String(), extID, "provider-a:"+extID).Scan(&id)
 	if err != nil {
 		t.Fatal(err)
@@ -239,8 +240,8 @@ func TestDatabaseEnforcesDomainRules(t *testing.T) {
 	insert := `
 		INSERT INTO wager_transactions (id, kind, wallet_id, player_id, amount_minor, currency, status,
 			provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
-			reference_external_transaction_id, failure_code, result_balance_minor, created_at, updated_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, 'BRL', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now(), now())`
+			reference_external_transaction_id, failure_code, result_balance_minor, created_at, updated_at, correlation_id)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, 'BRL', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now(), now(), 'schema-test')`
 	ext := func(id string) []any { return []any{"provider-a", id, "provider-a:" + id, hash, "round-1", "game-1"} }
 	cases := map[string][]any{
 		"second opening":           append([]any{"OPENING", w, p, 100, "PROCESSED"}, nil, nil, nil, nil, nil, nil, nil, nil, 100),

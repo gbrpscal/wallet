@@ -91,6 +91,9 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 | `HTTP_ADDR` | `:8080` | Endereço do servidor HTTP |
 | `DATABASE_URL` | *(obrigatória)* | URL de conexão do PostgreSQL, com o papel `wallet_app` |
 | `DB_LOCK_TIMEOUT` | `5s` | Espera máxima por lock de linha; ao estourar, a operação falha como transitória e nada é confirmado |
+| `REFERENCE_MAX_ATTEMPTS` | `10` | Tentativas do worker para uma reversão que espera a transação referenciada |
+| `REFERENCE_TTL` | `10m` | Prazo máximo de espera, contado da criação; o que vier primeiro (tentativas ou prazo) encerra com `REFERENCE_NOT_FOUND` |
+| `REFERENCE_BACKOFF_BASE` / `REFERENCE_BACKOFF_MAX` | `1s` / `60s` | Backoff exponencial entre tentativas (com ±20% de jitter) |
 | `AWS_REGION` | `us-east-1` | Região do SQS |
 | `AWS_ENDPOINT_URL` | — | Endpoint do SQS (LocalStack) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` / `test` | Credenciais (lidas pelo SDK da AWS) |
@@ -184,20 +187,23 @@ docker compose run --rm tools go test -race ./...
 | `internal/domain/wagering` | máquina de estados, regras dos cinco tipos externos, política de valor zero, reversões, referências pendentes, conflito de payload para a mesma chave, hash de idempotência, abertura interna |
 | `internal/domain/event` | envelope, tipo e versão, formato de valores e datas |
 | `internal/domain` | erros tipados, IDs, ausência de ponto flutuante, isolamento do domínio |
+| `internal/app` | política de espera (backoff, teto, expiração), retry de falhas transitórias, cursor do ledger |
 
-### Testes de integração de persistência
+### Testes de integração (persistência e casos de uso)
 
-Os testes com a tag `integration` usam o PostgreSQL real do Compose. Cada pacote cria um banco temporário `wallet_test_<aleatório>`, aplica as migrations como `wallet_owner`, executa os testes com o papel `wallet_app` e apaga o banco ao final. O banco da aplicação não é tocado.
+Os testes com a tag `integration` usam o PostgreSQL real do Compose. Cada pacote cria um banco temporário `wallet_test_<aleatório>` (helper em `internal/testutil/pgtest`), aplica as migrations como `wallet_owner`, executa os testes com o papel `wallet_app` e apaga o banco ao final. O banco da aplicação não é tocado.
 
 ```bash
 docker compose up -d --wait postgres
 ```
 
 ```bash
-docker compose run --rm tools go test -race -tags=integration ./internal/adapters/postgres/...
+docker compose run --rm tools go test -race -tags=integration ./internal/adapters/postgres/... ./internal/app/...
 ```
 
-Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL` (papel `wallet_owner`) apontando para o PostgreSQL e rode `go test -race -tags=integration ./internal/adapters/postgres/...`.
+Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL` (papel `wallet_owner`) apontando para o PostgreSQL e rode `go test -race -tags=integration ./internal/adapters/postgres/... ./internal/app/...`.
+
+**Persistência** (`internal/adapters/postgres`)
 
 | Teste | O que comprova |
 |---|---|
@@ -213,9 +219,28 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestUnitOfWorkRollsBackEverything` | atomicidade: nada é gravado se a transação falha |
 | `TestOutboxSnapshotIsImmutable`, `TestInboxDeduplicates` | snapshot imutável da outbox; deduplicação da inbox |
 
+**Casos de uso** (`internal/app`, com relógio controlado)
+
+| Teste | O que comprova |
+|---|---|
+| `TestOpenWallet` | abertura com 1000.00 (OPENING, lançamento e 2 eventos); saldo zero sem OPENING nem lançamento; segunda carteira do mesmo jogador e moeda em conflito |
+| `TestReplayReturnsOriginalResult` | replay devolve o saldo observado no processamento original, mesmo depois de a carteira mudar |
+| `TestIdempotencyConflicts` | mesma chave com outro conteúdo e mesma operação com outra chave resultam em conflito, sem efeito financeiro |
+| `TestKeyNotConsumedByCorrectableErrors` | entrada inválida e carteira inexistente não persistem nada; a chave continua utilizável |
+| `TestRejectionIsPersistedAndReplayed`, `TestLossHasNoMovement` | rejeição persistida e reproduzida; LOSS sem lançamento, sem nova versão e sem `WalletBalanceChanged` |
+| `TestFiftyIdenticalBetsInParallel` | a mesma aposta 50 vezes em paralelo gera um único débito |
+| `TestTwoBetsOf80OnWalletWith100` | uma processada, outra rejeitada por saldo, saldo final 20.00 e um único débito; reenvios não mudam o resultado |
+| `TestIndependentWalletsInParallel` | carteiras distintas processadas simultaneamente |
+| `TestReversalBeforeReferenceResolvedByWorker` | REFUND antes da BET fica pendente e é concluído pelo worker, com o correlationId original nos eventos |
+| `TestPendingReferenceExpiresAfterMaxAttempts`, `TestPendingReferenceExpiresAfterTTL` | expiração com `REFERENCE_NOT_FOUND` e evento de rejeição |
+| `TestConcurrentResolversProcessOnce` | várias tentativas simultâneas concluem a pendência uma única vez |
+| `TestRefundAndRollbackOfTheSameBet`, `TestRollbackOfWinWithoutFunds` | devolução única por aposta; reversão sem saldo com código próprio |
+| `TestReconciliation` | reconciliação consistente e detecção de divergência (log e resposta) sem alterar o saldo |
+| `TestLedgerPagination`, `TestTransactionLookupsAreProviderScoped`, `TestSameKeyFromAnotherProviderIsIndependent` | cursor opaco e limites; consultas e replays isolados por provedor |
+
 ### Testes de mutação
 
-O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger" e "lock da carteira sem FOR UPDATE". Os mutantes de persistência exigem o PostgreSQL no ar:
+O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE" e "worker ignora o horário agendado". Os mutantes de persistência e de casos de uso exigem o PostgreSQL no ar:
 
 ```bash
 docker compose up -d --wait postgres

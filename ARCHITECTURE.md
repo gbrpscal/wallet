@@ -41,8 +41,9 @@ internal/domain/             modelo puro (sem Fx, HTTP, SQS ou banco)
   wallet/                      Wallet (raiz de agregado) e LedgerEntry
   wagering/                    WagerTransaction, Request, hash e regras
   event/                       envelope e eventos concretos
-internal/app/                portas (UnitOfWork, repositórios), erros de infraestrutura;
-                             casos de uso (pendente)
+internal/app/                casos de uso (Service), portas (UnitOfWork, repositórios),
+                             políticas de retry e de espera, cursor, erros de infraestrutura
+internal/testutil/pgtest/     banco temporário para os testes de integração
 internal/adapters/
   postgres/                  pool, UnitOfWork, repositórios e classificação de erros
   httpapi/                   servidor, rotas e health checks
@@ -66,7 +67,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 2 | Esqueleto: toolchain, Compose, módulos Fx, health checks | concluída |
 | 3 | Domínio puro e testes unitários | concluída |
 | 4 | Persistência: migrations, constraints, repositórios | concluída |
-| 5 | Casos de uso | pendente |
+| 5 | Casos de uso | concluída |
 | 6 | HTTP e autenticação | pendente |
 | 7 | Consumidor SQS | pendente |
 | 8 | Outbox e workers | pendente |
@@ -391,7 +392,7 @@ Também valem estas regras:
   - Ao esgotar a espera, a reversão é finalizada como `REJECTED` com `REFERENCE_NOT_FOUND`, mesmo que a referência exista mas tenha ficado pendente até o fim.
 - **Critério impactado:** Integridade financeira e Mensageria e recuperação.
 - **Como verificar:** `TestReversalBeforeReference`, `TestReversalOfRejectedReference` e `TestExpire`.
-- **Limitações:** os parâmetros de espera (D4) estão pendentes.
+- **Limitações:** os parâmetros de espera estão na D4 (§4.12).
 
 #### Reversão sem saldo
 
@@ -413,6 +414,8 @@ Também valem estas regras:
 | Conflito | `IDEMPOTENCY_KEY_CONFLICT` | mesma chave, payload diferente | não |
 | Conflito | `EXTERNAL_TRANSACTION_CONFLICT` | mesma operação com outra chave | não |
 | Conflito | `WALLET_ALREADY_EXISTS` | mesmo `(playerId, currency)` | não |
+| Não encontrado | `WALLET_NOT_FOUND` | operação, consulta ou reconciliação de carteira inexistente | não |
+| Não encontrado | `TRANSACTION_NOT_FOUND` | consulta de transação inexistente (ou de outro provedor) | não |
 | Definitivo | `INSUFFICIENT_FUNDS` | `BET` sem saldo | `REJECTED` |
 | Definitivo | `REVERSAL_INSUFFICIENT_FUNDS` | reversão que debitaria além do saldo | `REJECTED` |
 | Definitivo | `CURRENCY_MISMATCH` | moeda diferente da moeda da carteira | `REJECTED` |
@@ -612,18 +615,143 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
 ```
 - **Limitações:** exige o PostgreSQL do Compose no ar. O `goose` como biblioteca traz dependências transitivas de outros drivers para o `go.mod`, usadas apenas pelos testes.
 
-### 4.12 Decisões pendentes
+### 4.12 Casos de uso
+
+`app.Service` reúne os casos de uso: `OpenWallet`, `SubmitOperation`, `ResolvePendingReference`, `DuePendingReferences`, `Reconcile`, `GetWallet`, `ListLedger`, `GetTransaction` e `GetTransactionByExternalID`. HTTP e SQS chamarão os mesmos métodos, com o mesmo `wagering.RequestInput`, então o hash, a idempotência e as regras são idênticos nos dois canais. O relógio é uma porta (`app.Clock`), o que deixa os testes de espera e de expiração determinísticos.
+
+#### D14. Processamento síncrono para operações sem dependência
+
+- **Contexto:** "Todo `PENDING` confirmado deve ter retomada durável por outra instância após interrupção. Operações sem dependências podem ser concluídas de forma síncrona, sem commit intermediário de aceite."
+- **Opções consideradas:** (a) síncrono para tudo o que não depende de referência; (b) sempre assíncrono (commit de `PENDING` e processamento por worker).
+- **Prós e contras:**
+  - (a) usa um único commit por operação, que já nasce terminal.
+  - (b) dobra commits e latência, e exige retomada de `PENDING` em todos os casos.
+- **Escolha e justificativa:** (a).
+  - `BET`, `WIN`, `LOSS`, `OPENING` e reversões com referência resolvida são processados e confirmados num único commit, já em `PROCESSED` ou `REJECTED`.
+  - Só a reversão sem referência disponível é confirmada como `PENDING_REFERENCE`, com o agendamento durável, e retomada pelo worker por qualquer instância.
+  - Como nenhuma transação é confirmada em `PENDING`, não há `PENDING` a retomar. Uma queda antes do commit não deixa nada gravado.
+- **Critério impactado:** Integridade financeira e Mensageria e recuperação.
+- **Como verificar:** `TestReplayReturnsOriginalResult` (resultado terminal na primeira resposta) e `TestReversalBeforeReferenceResolvedByWorker`.
+- **Limitações:** o cenário "interromper após confirmar `PENDING` e antes de executar" não se aplica (nenhum `PENDING` é confirmado). O equivalente, a retomada de `PENDING_REFERENCE` por outra instância, é demonstrado na Fase 10.
+
+#### Fluxo de idempotência e corrida entre requisições iguais
+
+- **Contexto:** "Mesma chave + conteúdo equivalente → resultado persistido com `idempotentReplay: true`." / "Mesma aposta enviada 50 vezes em paralelo → um único débito."
+- **Opções consideradas:** (a) busca sem lock, lock da carteira, nova busca e releitura em caso de colisão; (b) advisory lock por `(provider, chave)`; (c) reservar a chave com um INSERT de `PENDING`.
+- **Prós e contras:**
+  - (a) usa o lock que já existe por carteira, e o índice único é a rede de segurança.
+  - (b) acrescenta um lock e trava chaves sem relação quando há colisão de hash.
+  - (c) exige o commit intermediário de aceite, contradizendo a D14.
+- **Escolha e justificativa:** (a). Em `SubmitOperation`:
+  1. **Busca pela chave e, depois, pelo id externo**, sempre dentro do provedor e sem lock. Se encontrar, `CheckReplay` devolve o replay ou o conflito, sem travar a carteira.
+  2. **`Lock` da carteira** (inexistente: `WALLET_NOT_FOUND`, nada persistido).
+  3. **Nova busca sob o lock:** quem esperou na fila enxerga o que acabou de ser confirmado.
+  4. **Carrega a referência**, processa no domínio e grava transação, lançamento, saldo e eventos num único commit.
+  5. **Colisão residual** de índice único (por exemplo, a mesma chave usada para outra carteira) desfaz a transação. A nova tentativa refaz a busca e devolve o replay ou o conflito.
+  
+  O replay devolve o registro persistido, inclusive o saldo observado no processamento original, mesmo que a carteira tenha mudado depois.
+- **Critério impactado:** Idempotência e Concorrência.
+- **Como verificar:**
+  - `TestFiftyIdenticalBetsInParallel`: 50 envios paralelos produzem 1 transação, 1 débito e 49 replays com o mesmo saldo.
+  - `TestReplayReturnsOriginalResult`, `TestIdempotencyConflicts`, `TestRejectionIsPersistedAndReplayed`, `TestSameKeyFromAnotherProviderIsIndependent` e o mutante "replay não confere o payload".
+- **Limitações:** até aqui, demonstrado com um processo; múltiplos processos e HTTP × SQS ficam para as Fases 7 e 10.
+
+#### Erros corrigíveis não consomem a chave
+
+- **Escolha:** erros de entrada (`KindValidation`) e carteira inexistente (`WALLET_NOT_FOUND`) não persistem nada. A mesma chave pode ser usada de novo depois de corrigida a requisição. A transação também não poderia ser gravada sem carteira, por causa da FK.
+- **Como verificar:** `TestKeyNotConsumedByCorrectableErrors` e o mutante "carteira inexistente sem WALLET_NOT_FOUND".
+
+#### Retry de falhas transitórias no caso de uso
+
+- **Contexto:** "Falhas transitórias: retry com backoff." / "Indisponibilidade temporária do PostgreSQL" sem movimentação duplicada.
+- **Opções consideradas:** (a) retry curto dentro do caso de uso; (b) sem retry interno, ficando para o cliente HTTP ou para o SQS.
+- **Prós e contras:**
+  - (a) absorve deadlocks e conflitos momentâneos sem afetar o provedor.
+  - (b) é mais simples, mas um deadlock ocasional vira erro para o provedor.
+- **Escolha e justificativa:** (a). `RetryPolicy` faz até 3 novas tentativas depois da primeira, esperando 50, 100 e 200 ms (±20%). Só repete erros em que nada foi confirmado: `ErrTransient`, `ErrConcurrentUpdate` e `ErrDuplicate` (que, relido, vira replay ou conflito). Rejeições de negócio e erros de entrada nunca são repetidos. Esgotadas as tentativas, o erro sobe, e o HTTP (Fase 6) ou o SQS (Fase 7) decide.
+- **Como verificar:** `TestRetryPolicy`, `TestRetryStopsOnCancelledContext` e o mutante "retry não repete falha transitória".
+- **Limitações:** a repetição é segura porque cada tentativa é uma transação nova e completa, e a idempotência no banco impede efeito duplicado.
+
+#### D4. Espera por referência: 10 tentativas ou 10 minutos
+
+- **Contexto:** "Worker tenta novamente com backoff exponencial, inclusive após reinicialização. Número máximo de tentativas ou TTL. Esgotado: finalizar como `REJECTED` com código de referência não encontrada e evento de rejeição."
+- **Opções consideradas:** (a) 10 tentativas ou 10 minutos, o que vier primeiro; (b) só TTL de 30 minutos; (c) só 8 tentativas.
+- **Prós e contras:**
+  - (a) limita tanto o número de tentativas quanto o tempo.
+  - (b) é mais tolerante, mas o provedor espera mais por uma resposta definitiva.
+  - (c) tem duração real dependente do atraso do worker.
+- **Escolha e justificativa:** (a), configurável por `REFERENCE_MAX_ATTEMPTS`, `REFERENCE_TTL`, `REFERENCE_BACKOFF_BASE` e `REFERENCE_BACKOFF_MAX`.
+  - **Agendamento durável** em `wager_transactions` (`reference_attempts`, `next_reference_attempt_at`, `reference_expires_at`), por isso sobrevive a reinícios. Um CHECK exige agendamento em toda transação `PENDING_REFERENCE`.
+  - **Backoff:** primeira tentativa do worker 1 s após a criação, depois 2, 4, 8, 16, 32 e 60 s (teto), com ±20% de jitter em aritmética inteira. A próxima tentativa nunca é agendada depois do prazo final.
+  - **Contagem:** as tentativas contadas são as do worker. A tentativa sem sucesso que atinge o máximo, ou que acontece depois do prazo, finaliza a transação como `REJECTED` com `REFERENCE_NOT_FOUND` e emite `WagerTransactionRejected`.
+  - **Sempre há uma última tentativa** antes de expirar: se o worker ficou parado além do prazo e a referência chegou nesse meio-tempo, a reversão é concluída em vez de rejeitada.
+- **Critério impactado:** Mensageria e recuperação.
+- **Como verificar:** `TestReferencePolicyBackoff`, `TestReferencePolicyNeverSchedulesPastExpiry`, `TestReferencePolicyExhaustion`, `TestPendingReferenceExpiresAfterMaxAttempts`, `TestPendingReferenceExpiresAfterTTL` e os mutantes "espera não respeita o máximo de tentativas", "espera ignora o TTL" e "backoff sem teto".
+- **Limitações:** o loop do worker que chama `DuePendingReferences` e `ResolvePendingReference` periodicamente entra na Fase 8.
+
+#### Resolução das pendências: só pelo worker
+
+- **Opções consideradas:** (a) só pelo worker, no agendamento do backoff; (b) também na hora, no mesmo commit da referência; (c) na hora, antecipando o agendamento.
+- **Prós e contras:**
+  - (a) tem um caminho único e não acopla a operação da referência às reversões de terceiros.
+  - (b) resolve mais rápido, mas cria dois caminhos e põe operações de terceiros na transação da `BET`.
+  - (c) responde rápido mantendo um caminho único.
+- **Escolha e justificativa:** (a). `ResolvePendingReference`:
+  - lê a transação;
+  - trava a carteira e depois a transação, na mesma ordem de locks do restante do sistema;
+  - confere que ela continua em `PENDING_REFERENCE` e que a tentativa venceu;
+  - processa no domínio e grava tudo num commit.
+  
+  Várias instâncias podem chamar para a mesma transação: só uma conclui, e as demais recebem `skipped`.
+- **Como verificar:** `TestReversalBeforeReferenceResolvedByWorker` (inclusive `skipped` antes do horário), `TestConcurrentResolversProcessOnce` (8 chamadas simultâneas: 1 conclusão, 1 crédito) e o mutante "worker ignora o horário agendado".
+- **Limitações:** a resolução leva até o próximo agendamento (no máximo 60 s depois de a referência chegar).
+
+#### Rastreio persistido da requisição de origem
+
+- **Contexto:** eventos com `correlationId` e `causationId`; logs com os identificadores disponíveis.
+- **Opções consideradas:** (a) persistir `correlation_id` e `causation_id` da requisição que criou a transação; (b) gerar novos identificadores no worker.
+- **Prós e contras:**
+  - (a) faz os eventos emitidos depois pelo worker carregarem o mesmo `correlationId` da requisição HTTP ou SQS original, o que permite seguir a operação de ponta a ponta.
+  - (b) não muda o schema, mas perde essa ligação.
+- **Escolha e justificativa:** (a). A migration 00005 acrescenta as colunas, imutáveis por trigger. As linhas anteriores recebem `'unknown'`.
+- **Como verificar:** `TestReversalBeforeReferenceResolvedByWorker` (o evento do worker tem o `correlationId` da requisição original).
+
+#### Reconciliação: REPEATABLE READ somente leitura
+
+- **Contexto:** "Reconstrói o saldo a partir do ledger, incluindo a abertura, em uma visão consistente dos dados. `difference = storedBalance − calculatedBalance`. Divergências reportadas na resposta, nos logs e em métrica. Não altera o saldo."
+- **Opções consideradas:** (a) transação `REPEATABLE READ READ ONLY`; (b) lock `FOR SHARE` na carteira; (c) uma única query.
+- **Prós e contras:**
+  - (a) dá um snapshot único sem bloquear escritores e não aceita escrita.
+  - (b) faz as apostas daquela carteira esperarem.
+  - (c) fica frágil se a reconciliação crescer além de uma consulta.
+- **Escolha e justificativa:** (a), via `UnitOfWork.View`. A soma de créditos − débitos é feita no banco em `NUMERIC` e convertida para `int64` com checagem de faixa, sem ponto flutuante. Uma divergência resulta em `consistent = false` na resposta e em log `error` com carteira, valores e número de lançamentos; a métrica entra na Fase 9.
+- **Critério impactado:** Integridade financeira e Observabilidade.
+- **Como verificar:** `TestReconciliation`. O teste simula uma corrupção: o dono do schema desliga os triggers e altera o saldo. A divergência é detectada e logada, e o saldo não é alterado. O mutante "reconciliação sempre consistente" também é morto.
+- **Limitações:** não corrige divergências; a correção exige novos lançamentos.
+
+#### Paginação do ledger
+
+- **Cursor:** `base64url({"v":1,"after":<walletVersion>})`. É opaco para o cliente, com ordenação estável por `walletVersion`. Cursor malformado, de outra versão de formato ou com versão negativa resulta em `INVALID_REQUEST`. Ele não é assinado: alterá-lo só muda a página dentro da carteira já autorizada. A alternativa assinada (HMAC) exigiria um segredo sem ganho real, e a versão numérica direta não seria opaca.
+- **Tamanho:** padrão 50 (o exemplo do enunciado). Valores fora de 1 a 200 resultam em `INVALID_REQUEST`, sem ajuste silencioso. A busca pede um lançamento a mais, para saber se existe página seguinte sem devolver uma página vazia.
+- **Como verificar:** `TestLedgerPagination`, `TestCursor` e os mutantes "cursor repete o último lançamento" e "cursor aceita versão negativa".
+
+#### Consultas
+
+- `GetWallet`, `GetTransaction`, `GetTransactionByExternalID` e `ListLedger` usam `View`.
+- `GetTransactionByExternalID` é sempre escopada pelo provedor; o provedor errado recebe `TRANSACTION_NOT_FOUND`, sem revelar a existência da operação.
+- A autorização por provedor em `GetTransaction` (busca por id interno) é feita pela camada HTTP (Fase 6).
+- **Como verificar:** `TestTransactionLookupsAreProviderScoped`.
+
+### 4.13 Decisões pendentes
 
 | # | Decisão | Fase |
 |---|---|---|
-| D4 | Tentativas, TTL e backoff de `PENDING_REFERENCE` | 5 |
-| D14 | Aceite síncrono ou assíncrono | 5 |
-| D6 | Mapeamento de códigos para HTTP | 5/6 |
+| D6 | Mapeamento de códigos para HTTP | 6 |
 | D8 | Validação de token, permissões e identificação do provedor | 6 |
 | D9 | `MessageGroupId`, deduplicação, visibility timeout, `maxReceiveCount`, mensagens inválidas | 7 |
 | D10 | Destino dos eventos e contrato de roteamento | 8 |
 
-### 4.13 Composição com Fx e ciclo de vida (parcial)
+### 4.14 Composição com Fx e ciclo de vida (parcial)
 
 - **Contexto:** "Fx compõe configuração, conexões, repositórios, casos de uso, handlers e workers […] fechamento das dependências depois dos componentes que as utilizam."
 - **Implementado até aqui:**
@@ -636,7 +764,7 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
 - **Como verificar:** hoje, de forma manual: `docker compose stop app` mostra no log o hook do servidor executando antes do hook do pool. O teste automatizado da composição Fx será feito na Fase 10.
 - **Pendente:** workers (consumidor, publisher, referências) e o shutdown seguro do consumidor SQS.
 
-### 4.14 Ambiente, ferramentas e testes
+### 4.15 Ambiente, ferramentas e testes
 
 #### Toolchain sem instalação local
 
@@ -708,7 +836,7 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 45 mutantes mortos e 0 problemas (28 de domínio e 17 de persistência, estes com o PostgreSQL no ar).
+- **Como verificar:** o comando abaixo, que hoje dá 57 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência e 12 de casos de uso (os dois últimos grupos com o PostgreSQL no ar).
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
@@ -726,12 +854,12 @@ docker compose run --rm tools bash scripts/mutation.sh
 
 | Critério | Pontos | Evidência atual | Pendente |
 |---|---|---|---|
-| Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8). No banco: saldo ≥ 0, ledger append-only (privilégio + trigger), cadeia do ledger e conferência saldo × ledger no commit, máquina de estados e regras dos tipos (§4.11) | reconciliação |
-| Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11) | testes com ≥ 3 processos |
-| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`) | fluxo de replay nos casos de uso; HTTP × SQS |
-| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11) | consumidor, publisher, retries, DLQ, shutdown |
-| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.13) | autenticação e autorização |
-| Testes | 10 | testes unitários e 24 testes de integração com PostgreSQL real, todos com `-race`; 45/45 mutantes mortos, incluindo 17 de SQL e repositórios (§4.14) | isolamento entre provedores na API, paralelismo multiprocesso, interrupção |
+| Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8). No banco: saldo ≥ 0, ledger append-only (privilégio + trigger), cadeia do ledger e conferência saldo × ledger no commit, máquina de estados e regras dos tipos (§4.11); reconciliação em snapshot único que detecta divergência sem alterar o saldo (`TestReconciliation`, §4.12) | — |
+| Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11); `TestFiftyIdenticalBetsInParallel`, `TestTwoBetsOf80OnWalletWith100`, `TestIndependentWalletsInParallel` (§4.12) | testes com ≥ 3 processos |
+| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12) | HTTP × SQS |
+| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12) | consumidor, publisher, loop do worker, DLQ, shutdown |
+| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.14) | autenticação e autorização |
+| Testes | 10 | testes unitários e de integração (repositórios e casos de uso) com PostgreSQL real, todos com `-race`; 57/57 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso (§4.15) | isolamento entre provedores na API, paralelismo multiprocesso, interrupção |
 | Observabilidade | 5 | logs JSON; `/health/live`; `/health/ready` com PostgreSQL e SQS | IDs nos logs; métricas |
 | Documentação | 5 | este documento e o README | revisão final |
 
@@ -742,7 +870,7 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Garantia | Estado | Evidência |
 |---|---|---|
 | Dinheiro nunca passa por `float32`/`float64` | ✅ | `TestNoFloatingPointInProductionCode`; parsing estrito; JSON numérico rejeitado |
-| Idempotência persistente, sobrevive ao reinício | parcial | chave, hash e resultado persistidos com unicidade no banco (§4.11); fluxo de replay e reinício nas Fases 5 e 10 |
+| Idempotência persistente, sobrevive ao reinício | parcial | chave, hash e resultado persistidos com unicidade no banco; replay lido do banco (§4.11, §4.12). Reinício de todos os processos na Fase 10 |
 | Invariantes financeiras garantidas no banco | ✅ | §4.11: CHECKs, triggers de cadeia, de versão e de estado, conferência diferida saldo × ledger; `TestBalanceChangeRequiresLedgerEntry`, `TestDatabaseEnforcesDomainRules` |
 | Eventos externos publicados só após o commit | pendente | Fase 8 (a outbox já é gravada no mesmo commit: `TestUnitOfWorkRollsBackEverything`) |
 | Ledger append-only; correções por novos lançamentos | ✅ | privilégio só `SELECT`/`INSERT` para a aplicação e triggers contra `UPDATE`/`DELETE`/`TRUNCATE`; `TestLedgerIsAppendOnly` |
@@ -755,8 +883,8 @@ docker compose run --rm tools bash scripts/mutation.sh
 
 ## 7. Limitações e trabalho não concluído
 
-- Casos de uso, HTTP, autenticação, consumidor SQS, publisher da outbox, workers e métricas ainda não foram implementados (ver §2).
-- As decisões D4, D6 (parte HTTP), D8, D9, D10 e D14 estão pendentes (§4.12).
+- HTTP, autenticação, consumidor SQS, publisher da outbox, loop do worker de referências e métricas ainda não foram implementados (ver §2).
+- As decisões D6 (parte HTTP), D8, D9 e D10 estão pendentes (§4.13).
 - A concorrência só foi demonstrada com um processo; a prova com ≥ 3 processos independentes fica para a Fase 10.
 - O banco não confere que a transação está `PROCESSED` quando o seu lançamento é gravado (§4.11).
 - Moedas limitadas a BRL, USD e EUR, todas com 2 casas decimais.
