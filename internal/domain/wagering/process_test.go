@@ -49,7 +49,7 @@ func process(t *testing.T, tx *wagering.WagerTransaction, w *wallet.Wallet, ref 
 	return out
 }
 
-// processedRef builds a PROCESSED transaction to be used as a reference.
+// processedRef constrói uma transação PROCESSED para ser usada como referência.
 func processedRef(t *testing.T, w *wallet.Wallet, opts ...func(*wagering.RequestInput)) *wagering.WagerTransaction {
 	t.Helper()
 	tx := pending(t, opts...)
@@ -75,8 +75,8 @@ func TestBetDebits(t *testing.T) {
 	}
 }
 
-// TestTwoBetsOf80OnWalletWith100 is the domain view of the mandatory
-// scenario: one bet is processed, the other rejected for insufficient funds.
+// TestTwoBetsOf80OnWalletWith100 é a visão de domínio do cenário obrigatório:
+// uma aposta é processada e a outra rejeitada por saldo insuficiente.
 func TestTwoBetsOf80OnWalletWith100(t *testing.T) {
 	w := openWallet(t, "100.00")
 	first := processed(t, pending(t, op("BET", "bet-1", "80.00", "")), w, wagering.Reference{})
@@ -243,9 +243,9 @@ func TestReversalOfRejectedReference(t *testing.T) {
 	assertRejected(t, out, w, domain.CodeReferenceNotProcessed, "10.00", 1)
 }
 
-// TestReversalBeforeReference covers a REFUND arriving before its BET: it
-// waits, stays waiting while the reference is missing or pending, and
-// completes once the reference is processed.
+// TestReversalBeforeReference cobre um REFUND que chega antes da sua BET: ele
+// espera, continua esperando enquanto a referência está ausente ou pendente e
+// conclui quando a referência é processada.
 func TestReversalBeforeReference(t *testing.T) {
 	w := openWallet(t, "100.00")
 	refund := pending(t, op("REFUND", "refund-1", "30.00", "bet-1"))

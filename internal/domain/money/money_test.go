@@ -137,7 +137,7 @@ func TestArithmetic(t *testing.T) {
 	if c, _ := a.Cmp(mustParse(t, "100.00", "BRL")); c != 0 {
 		t.Errorf("Cmp(100, 100) = %d", c)
 	}
-	// Immutability: operands are unchanged.
+	// Imutabilidade: os operandos não mudam.
 	if a.Amount() != "100.00" || b.Amount() != "80.00" {
 		t.Error("operations must not modify operands")
 	}

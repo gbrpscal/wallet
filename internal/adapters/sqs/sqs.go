@@ -1,4 +1,4 @@
-// Package sqs provides the Amazon SQS client and messaging adapters.
+// Package sqs fornece o cliente Amazon SQS e os adaptadores de mensageria.
 package sqs
 
 import (
@@ -14,7 +14,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/platform/health"
 )
 
-// Module provides the SQS client and its readiness check.
+// Module fornece o cliente SQS e sua checagem de readiness.
 var Module = fx.Module("sqs",
 	fx.Provide(
 		NewClient,
@@ -22,8 +22,8 @@ var Module = fx.Module("sqs",
 	),
 )
 
-// NewClient builds an SQS client. Credentials come from the standard AWS
-// environment variables; the endpoint override points to the local emulator.
+// NewClient constrói um cliente SQS. As credenciais vêm das variáveis de
+// ambiente padrão da AWS; o endpoint sobrescrito aponta para o emulador local.
 func NewClient(cfg config.Config) (*sqs.Client, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
@@ -36,7 +36,7 @@ func NewClient(cfg config.Config) (*sqs.Client, error) {
 	}), nil
 }
 
-// NewReadinessCheck verifies that the inbound wager queue is reachable.
+// NewReadinessCheck verifica se a fila de entrada de wagering está acessível.
 func NewReadinessCheck(client *sqs.Client, cfg config.Config) health.CheckerFunc {
 	return health.CheckerFunc{
 		CheckName: "sqs",

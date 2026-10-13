@@ -10,30 +10,30 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/wallet"
 )
 
-// Reference is what the caller found for the transaction's reference, loaded
-// in the same SQL transaction: by (providerId, referenceExternalTransactionId).
+// Reference é o que quem chama encontrou para a referência da transação,
+// carregado na mesma transação SQL por (providerId, referenceExternalTransactionId).
 type Reference struct {
-	// Transaction is nil when no transaction with that external id exists.
+	// Transaction é nil quando não existe transação com esse id externo.
 	Transaction *WagerTransaction
-	// Reversed is true when a PROCESSED reversal already points to it.
+	// Reversed é true quando uma reversão PROCESSED já aponta para ela.
 	Reversed bool
 }
 
-// Outcome is everything one processing step produced. The caller persists the
-// transaction, the wallet, the entry and the events in a single commit.
+// Outcome é tudo o que um passo de processamento produziu. Quem chama persiste
+// transação, carteira, lançamento e eventos em um único commit.
 type Outcome struct {
 	Transaction *WagerTransaction
-	// Entry is nil when the balance did not change.
+	// Entry é nil quando o saldo não mudou.
 	Entry  *wallet.LedgerEntry
 	Events []event.Event
-	// Waiting is true when the transaction stays PENDING_REFERENCE with no
-	// change at all; there is nothing to persist except retry bookkeeping.
+	// Waiting é true quando a transação continua PENDING_REFERENCE sem
+	// nenhuma mudança; não há o que persistir além do controle de retry.
 	Waiting bool
 }
 
-// Process applies the rules of the transaction's kind to the wallet.
-// Business rejections are not errors: they are returned as an Outcome with
-// the transaction REJECTED. A returned error means nothing may be persisted.
+// Process aplica as regras do tipo da transação à carteira. Rejeições de
+// negócio não são erros: voltam como Outcome com a transação REJECTED. Um erro
+// retornado significa que nada pode ser persistido.
 func Process(tx *WagerTransaction, w *wallet.Wallet, ref Reference, trace event.Trace, now time.Time) (Outcome, error) {
 	if tx == nil || w == nil {
 		return Outcome{}, domain.Errorf(domain.ErrInconsistentState, "process requires transaction and wallet")
@@ -73,9 +73,9 @@ func Process(tx *WagerTransaction, w *wallet.Wallet, ref Reference, trace event.
 	}
 }
 
-// Expire finalizes a transaction whose reference never became available
-// within the retry policy. w may be nil when the wallet is not loaded; the
-// observed balance is then not recorded.
+// Expire finaliza uma transação cuja referência não ficou disponível dentro da
+// política de retry. w pode ser nil quando a carteira não foi carregada; nesse
+// caso o saldo observado não é registrado.
 func Expire(tx *WagerTransaction, w *wallet.Wallet, trace event.Trace, now time.Time) (Outcome, error) {
 	if tx == nil {
 		return Outcome{}, domain.Errorf(domain.ErrInconsistentState, "expire requires a transaction")
@@ -99,8 +99,8 @@ type processor struct {
 
 func (p processor) win(ref Reference) (Outcome, error) {
 	if ref.Transaction == nil {
-		// The WIN credit does not depend on the bet: an unknown optional
-		// reference stays recorded and is not resolved.
+		// O crédito do WIN não depende da aposta: uma referência opcional
+		// desconhecida fica registrada e não é resolvida.
 		return p.move(wallet.Credit, domain.TransactionID{}, "")
 	}
 	r := ref.Transaction
@@ -113,8 +113,8 @@ func (p processor) win(ref Reference) (Outcome, error) {
 	return p.move(wallet.Credit, r.id, "")
 }
 
-// reversal implements REFUND and ROLLBACK. Static checks come first so a
-// request that can never succeed is rejected without waiting.
+// reversal implementa REFUND e ROLLBACK. As checagens estáticas vêm primeiro,
+// para que uma requisição que nunca terá sucesso seja rejeitada sem esperar.
 func (p processor) reversal(ref Reference) (Outcome, error) {
 	r := ref.Transaction
 	if r == nil {
@@ -138,14 +138,14 @@ func (p processor) reversal(ref Reference) (Outcome, error) {
 	if ref.Reversed {
 		return p.reject(domain.CodeAlreadyReversed)
 	}
-	// The reversal moves money in the opposite direction of the original.
+	// A reversão movimenta no sentido contrário ao da operação original.
 	if r.kind == Bet {
 		return p.move(wallet.Credit, r.id, "")
 	}
 	return p.move(wallet.Debit, r.id, domain.CodeReversalInsufficient)
 }
 
-// reversible: REFUND undoes a BET; ROLLBACK undoes a BET, WIN or REFUND.
+// reversible: REFUND desfaz uma BET; ROLLBACK desfaz uma BET, WIN ou REFUND.
 func reversible(kind, target Kind) bool {
 	switch kind {
 	case Refund:
@@ -157,7 +157,7 @@ func reversible(kind, target Kind) bool {
 	}
 }
 
-// sameScope checks the fields an operation and its reference must share.
+// sameScope confere os campos que a operação e sua referência devem compartilhar.
 func (p processor) sameScope(r *WagerTransaction) bool {
 	return r.providerID == p.tx.providerID &&
 		r.playerID == p.tx.playerID &&
@@ -166,8 +166,8 @@ func (p processor) sameScope(r *WagerTransaction) bool {
 		r.roundID == p.tx.roundID
 }
 
-// move debits or credits the wallet. insufficient is the rejection code used
-// when a debit would make the balance negative.
+// move debita ou credita a carteira. insufficient é o código de rejeição usado
+// quando um débito deixaria o saldo negativo.
 func (p processor) move(dir wallet.Direction, ref domain.TransactionID, insufficient domain.Code) (Outcome, error) {
 	var entry wallet.LedgerEntry
 	var err error
@@ -209,8 +209,8 @@ func (p processor) processed(entry *wallet.LedgerEntry, ref domain.TransactionID
 }
 
 func (p processor) reject(code domain.Code) (Outcome, error) {
-	// The observed balance is only recorded when it is expressed in the
-	// operation's currency (not the case for CURRENCY_MISMATCH).
+	// O saldo observado só é registrado quando está na moeda da operação
+	// (o que não ocorre em CURRENCY_MISMATCH).
 	var observed money.Money
 	if p.w != nil && p.w.Currency() == p.tx.money.Currency() {
 		observed = p.w.Balance()
@@ -229,8 +229,8 @@ func (p processor) reject(code domain.Code) (Outcome, error) {
 	return Outcome{Transaction: p.tx, Events: []event.Event{rejected}}, nil
 }
 
-// wait moves PENDING to PENDING_REFERENCE with its event; a transaction
-// already waiting stays as it is, with nothing to persist.
+// wait leva PENDING para PENDING_REFERENCE com o respectivo evento; uma
+// transação que já está esperando fica como está, sem nada a persistir.
 func (p processor) wait() (Outcome, error) {
 	if p.tx.status == PendingReference {
 		return Outcome{Transaction: p.tx, Waiting: true}, nil
@@ -262,19 +262,19 @@ func transactionRef(t *WagerTransaction) event.TransactionRef {
 	}
 }
 
-// OpenOutcome is everything opening a wallet produced, committed together.
+// OpenOutcome é tudo o que a abertura de carteira produziu, confirmado junto.
 type OpenOutcome struct {
 	Wallet *wallet.Wallet
-	// Opening, Entry and Events are empty for a zero initial balance.
+	// Opening, Entry e Events ficam vazios quando o saldo inicial é zero.
 	Opening *WagerTransaction
 	Entry   *wallet.LedgerEntry
 	Events  []event.Event
 }
 
-// OpenWallet creates a wallet. A positive initial balance also produces the
-// internal OPENING transaction (PROCESSED), its credit entry and the
-// WagerTransactionProcessed and WalletBalanceChanged events. A zero initial
-// balance produces none of them.
+// OpenWallet cria uma carteira. Saldo inicial positivo também produz a
+// transação interna OPENING (PROCESSED), seu lançamento de crédito e os eventos
+// WagerTransactionProcessed e WalletBalanceChanged. Saldo inicial zero não
+// produz nenhum deles.
 func OpenWallet(playerID domain.PlayerID, initial money.Money, trace event.Trace, now time.Time) (OpenOutcome, error) {
 	if err := trace.Validate(); err != nil {
 		return OpenOutcome{}, err

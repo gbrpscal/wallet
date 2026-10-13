@@ -1,4 +1,4 @@
-// Package wallet holds the Wallet aggregate root and its ledger entries.
+// Package wallet contém a raiz de agregado Wallet e seus lançamentos de ledger.
 package wallet
 
 import (
@@ -8,12 +8,12 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/money"
 )
 
-// InitialVersion is the version of a newly opened wallet.
+// InitialVersion é a versão de uma carteira recém-aberta.
 const InitialVersion int64 = 1
 
-// Wallet is the financial aggregate root. Its balance only changes through
-// Debit and Credit, each of which returns the matching ledger entry; the
-// caller must persist both in the same SQL transaction.
+// Wallet é a raiz do agregado financeiro. O saldo só muda por Debit e Credit,
+// e cada um devolve o lançamento correspondente; quem chama deve persistir os
+// dois na mesma transação SQL.
 type Wallet struct {
 	id        domain.WalletID
 	playerID  domain.PlayerID
@@ -24,8 +24,8 @@ type Wallet struct {
 	updatedAt time.Time
 }
 
-// Snapshot carries every field of a wallet, for reconstruction from
-// persistence.
+// Snapshot carrega todos os campos de uma carteira, para reconstrução a partir
+// da persistência.
 type Snapshot struct {
 	ID        domain.WalletID
 	PlayerID  domain.PlayerID
@@ -36,9 +36,9 @@ type Snapshot struct {
 	UpdatedAt time.Time
 }
 
-// Open creates a wallet with version 1. A positive initial balance produces
-// the opening credit entry, linked to the internal OPENING transaction; a zero
-// initial balance produces no entry and openingTx may be zero.
+// Open cria uma carteira com versão 1. Saldo inicial positivo produz o
+// lançamento de crédito da abertura, ligado à transação interna OPENING; saldo
+// inicial zero não produz lançamento e openingTx pode ser zero.
 func Open(id domain.WalletID, playerID domain.PlayerID, initial money.Money, openingTx domain.TransactionID, now time.Time) (*Wallet, *LedgerEntry, error) {
 	if id.IsZero() || playerID.IsZero() {
 		return nil, nil, domain.Errorf(domain.ErrInvalidRequest, "wallet requires id and player")
@@ -76,8 +76,9 @@ func Open(id domain.WalletID, playerID domain.PlayerID, initial money.Money, ope
 	return w, &entry, nil
 }
 
-// Rehydrate rebuilds a persisted wallet without applying any movement.
-// Persisted data that violates an invariant is reported as INCONSISTENT_STATE.
+// Rehydrate reconstrói uma carteira persistida sem aplicar nenhuma
+// movimentação. Dado persistido que viola invariante é reportado como
+// INCONSISTENT_STATE.
 func Rehydrate(s Snapshot) (*Wallet, error) {
 	switch {
 	case s.ID.IsZero() || s.PlayerID.IsZero():
@@ -102,9 +103,9 @@ func Rehydrate(s Snapshot) (*Wallet, error) {
 	}, nil
 }
 
-// Debit subtracts amount, keeping the balance non-negative. On insufficient
-// funds it returns ErrInsufficientFunds and leaves the wallet unchanged; the
-// caller decides which rejection code applies (bet or reversal).
+// Debit subtrai amount mantendo o saldo não negativo. Sem saldo suficiente,
+// devolve ErrInsufficientFunds e deixa a carteira inalterada; quem chama decide
+// qual código de rejeição se aplica (aposta ou reversão).
 func (w *Wallet) Debit(txID domain.TransactionID, amount money.Money, now time.Time) (LedgerEntry, error) {
 	if err := w.checkMovement(txID, amount, now); err != nil {
 		return LedgerEntry{}, err
@@ -123,7 +124,7 @@ func (w *Wallet) Debit(txID domain.TransactionID, amount money.Money, now time.T
 	return w.apply(txID, Debit, amount, after, now)
 }
 
-// Credit adds amount.
+// Credit soma amount.
 func (w *Wallet) Credit(txID domain.TransactionID, amount money.Money, now time.Time) (LedgerEntry, error) {
 	if err := w.checkMovement(txID, amount, now); err != nil {
 		return LedgerEntry{}, err
@@ -154,9 +155,9 @@ func (w *Wallet) checkMovement(txID domain.TransactionID, amount money.Money, no
 	return nil
 }
 
-// apply builds the entry first and only then mutates the wallet, so a failure
-// leaves the aggregate untouched. The version increments only here, i.e. only
-// when the balance changes.
+// apply constrói o lançamento primeiro e só então altera a carteira, para que
+// uma falha deixe o agregado intacto. A versão só incrementa aqui, ou seja,
+// somente quando o saldo muda.
 func (w *Wallet) apply(txID domain.TransactionID, dir Direction, amount, after money.Money, now time.Time) (LedgerEntry, error) {
 	now = domain.Timestamp(now)
 	entry, err := newEntry(w.id, txID, dir, amount, w.balance, after, now)

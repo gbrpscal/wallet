@@ -13,7 +13,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/platform/health"
 )
 
-// HealthHandler serves the public liveness and readiness endpoints.
+// HealthHandler atende os endpoints públicos de liveness e readiness.
 type HealthHandler struct {
 	checkers     []health.Checker
 	cfg          config.Config
@@ -21,7 +21,7 @@ type HealthHandler struct {
 	shuttingDown atomic.Bool
 }
 
-// HealthParams collects the readiness checks contributed by adapters.
+// HealthParams reúne as checagens de readiness fornecidas pelos adaptadores.
 type HealthParams struct {
 	fx.In
 	Checkers []health.Checker `group:"readiness"`
@@ -29,13 +29,13 @@ type HealthParams struct {
 	Log      *slog.Logger
 }
 
-// NewHealthHandler builds the handler.
+// NewHealthHandler constrói o handler.
 func NewHealthHandler(p HealthParams) *HealthHandler {
 	return &HealthHandler{checkers: p.Checkers, cfg: p.Config, log: p.Log}
 }
 
-// MarkShuttingDown makes readiness fail so load balancers stop routing new
-// requests while in-flight ones finish.
+// MarkShuttingDown faz a readiness falhar, para que os balanceadores parem de
+// encaminhar novas requisições enquanto as que estão em andamento terminam.
 func (h *HealthHandler) MarkShuttingDown() { h.shuttingDown.Store(true) }
 
 type healthResponse struct {
@@ -43,13 +43,13 @@ type healthResponse struct {
 	Checks map[string]string `json:"checks,omitempty"`
 }
 
-// Live reports that the process is running.
+// Live informa que o processo está em execução.
 func (h *HealthHandler) Live(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
 }
 
-// Ready reports whether PostgreSQL and SQS are reachable. Error details are
-// logged, not returned, because the endpoint is public.
+// Ready informa se PostgreSQL e SQS estão acessíveis. Os detalhes de erro vão
+// para o log e não para a resposta, porque o endpoint é público.
 func (h *HealthHandler) Ready(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{Status: "ok", Checks: make(map[string]string, len(h.checkers))}
 	if h.shuttingDown.Load() {

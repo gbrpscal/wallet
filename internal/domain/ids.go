@@ -8,8 +8,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// ID is a UUID typed by the entity it identifies, so a WalletID can never be
-// passed where a TransactionID is expected. The zero value is invalid.
+// ID é um UUID tipado pela entidade que identifica, de modo que um WalletID
+// nunca pode ser passado onde se espera um TransactionID. O valor zero é inválido.
 type ID[T any] struct {
 	value uuid.UUID
 }
@@ -30,12 +30,12 @@ type (
 	EventID       = ID[eventTag]
 )
 
-// AnyID is satisfied by every typed ID (WalletID, TransactionID, ...).
+// AnyID é satisfeito por todo ID tipado (WalletID, TransactionID, ...).
 type AnyID interface {
 	~struct{ value uuid.UUID }
 }
 
-// NewID returns a new time-ordered UUIDv7, e.g. NewID[WalletID]().
+// NewID devolve um novo UUIDv7 ordenado no tempo, por exemplo NewID[WalletID]().
 func NewID[I AnyID]() (I, error) {
 	u, err := uuid.NewV7()
 	if err != nil {
@@ -44,9 +44,9 @@ func NewID[I AnyID]() (I, error) {
 	return I{value: u}, nil
 }
 
-// ParseID accepts only the canonical 36-character hyphenated form, in any
-// letter case; other forms accepted by the uuid library (URN, braces, no
-// hyphens) are rejected. The nil UUID is rejected.
+// ParseID aceita só a forma canônica de 36 caracteres com hífens, em qualquer
+// caixa; outras formas aceitas pela biblioteca uuid (URN, chaves, sem hífens)
+// são rejeitadas. O UUID nulo é rejeitado.
 func ParseID[I AnyID](s string) (I, error) {
 	if len(s) != 36 {
 		return I{}, Errorf(ErrInvalidRequest, "invalid uuid %q", truncate(s))
@@ -58,7 +58,7 @@ func ParseID[I AnyID](s string) (I, error) {
 	return I{value: u}, nil
 }
 
-// MustParseID parses a known-valid literal. Intended for tests.
+// MustParseID interpreta um literal sabidamente válido. Destinado a testes.
 func MustParseID[I AnyID](s string) I {
 	id, err := ParseID[I](s)
 	if err != nil {
@@ -67,13 +67,13 @@ func MustParseID[I AnyID](s string) I {
 	return id
 }
 
-// String returns the canonical lowercase form.
+// String devolve a forma canônica em minúsculas.
 func (id ID[T]) String() string { return id.value.String() }
 
-// IsZero reports whether the id is uninitialized.
+// IsZero informa se o id não foi inicializado.
 func (id ID[T]) IsZero() bool { return id.value == uuid.Nil }
 
-// MarshalText implements encoding.TextMarshaler; an uninitialized id fails.
+// MarshalText implementa encoding.TextMarshaler; um id não inicializado falha.
 func (id ID[T]) MarshalText() ([]byte, error) {
 	if id.IsZero() {
 		return nil, Errorf(ErrInconsistentState, "uninitialized id")
@@ -81,13 +81,13 @@ func (id ID[T]) MarshalText() ([]byte, error) {
 	return []byte(id.String()), nil
 }
 
-// MaxTextIDLength is the maximum size, in bytes, of provider supplied textual
-// identifiers.
+// MaxTextIDLength é o tamanho máximo, em bytes, dos identificadores textuais
+// informados pelo provedor.
 const MaxTextIDLength = 255
 
-// ValidateTextID checks a provider supplied identifier: non-empty, at most
-// MaxTextIDLength bytes, valid UTF-8, no control characters and no leading or
-// trailing whitespace (rejected rather than trimmed).
+// ValidateTextID confere um identificador informado pelo provedor: não vazio,
+// no máximo MaxTextIDLength bytes, UTF-8 válido, sem caracteres de controle e
+// sem espaço nas pontas (rejeitado, não removido).
 func ValidateTextID(field, s string) error {
 	switch {
 	case s == "":

@@ -1,5 +1,5 @@
-// Package money implements an exact monetary value object stored as int64
-// minor units with a fixed scale of two decimal places.
+// Package money implementa um value object monetário exato, armazenado em
+// unidades mínimas int64 com escala fixa de duas casas decimais.
 package money
 
 import (
@@ -10,18 +10,17 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain"
 )
 
-// Scale is the number of decimal places of every supported currency.
+// Scale é o número de casas decimais de toda moeda suportada.
 const Scale = 2
 
 const minorPerUnit = 100
 
-// Currency is an ISO 4217 code from the supported set. The zero value is
-// invalid.
+// Currency é um código ISO 4217 do conjunto suportado. O valor zero é inválido.
 type Currency struct {
 	code string
 }
 
-// Supported currencies. All of them use two decimal places, matching Scale.
+// Moedas suportadas. Todas usam duas casas decimais, coerente com Scale.
 var (
 	BRL = Currency{code: "BRL"}
 	USD = Currency{code: "USD"}
@@ -30,7 +29,7 @@ var (
 
 var supported = map[string]Currency{"BRL": BRL, "USD": USD, "EUR": EUR}
 
-// ParseCurrency accepts only the exact upper-case code of a supported currency.
+// ParseCurrency aceita somente o código exato, em maiúsculas, de uma moeda suportada.
 func ParseCurrency(code string) (Currency, error) {
 	c, ok := supported[code]
 	if !ok {
@@ -39,21 +38,21 @@ func ParseCurrency(code string) (Currency, error) {
 	return c, nil
 }
 
-// String returns the ISO 4217 code.
+// String devolve o código ISO 4217.
 func (c Currency) String() string { return c.code }
 
-// IsZero reports whether the currency is uninitialized.
+// IsZero informa se a moeda não foi inicializada.
 func (c Currency) IsZero() bool { return c.code == "" }
 
-// Money is an immutable amount in minor units plus its currency. Negative
-// values are allowed for internal differences; external parsing rejects them.
-// The zero value is invalid: use Zero(currency).
+// Money é um valor imutável em unidades mínimas mais a sua moeda. Valores
+// negativos são permitidos em diferenças internas; o parsing externo os
+// rejeita. O valor zero do tipo é inválido: use Zero(currency).
 type Money struct {
 	minor    int64
 	currency Currency
 }
 
-// Zero returns zero in the given currency.
+// Zero devolve zero na moeda informada.
 func Zero(c Currency) (Money, error) {
 	if c.IsZero() {
 		return Money{}, domain.Errorf(domain.ErrUnsupportedCurrency, "uninitialized currency")
@@ -61,7 +60,7 @@ func Zero(c Currency) (Money, error) {
 	return Money{currency: c}, nil
 }
 
-// FromMinor builds a value from minor units, as read from persistence.
+// FromMinor constrói um valor a partir de unidades mínimas, como lidas da persistência.
 func FromMinor(minor int64, c Currency) (Money, error) {
 	if c.IsZero() {
 		return Money{}, domain.Errorf(domain.ErrUnsupportedCurrency, "uninitialized currency")
@@ -69,9 +68,9 @@ func FromMinor(minor int64, c Currency) (Money, error) {
 	return Money{minor: minor, currency: c}, nil
 }
 
-// Parse reads an external amount. Only the strict form
-// `^(0|[1-9][0-9]*)\.[0-9]{2}$` is accepted: no sign, no exponent, no
-// whitespace, no leading zeros and exactly two decimals. Nothing is rounded.
+// Parse lê um valor externo. Só a forma estrita `^(0|[1-9][0-9]*)\.[0-9]{2}$`
+// é aceita: sem sinal, sem expoente, sem espaços, sem zeros à esquerda e com
+// exatamente duas casas. Nada é arredondado.
 func Parse(amount, currency string) (Money, error) {
 	c, err := ParseCurrency(currency)
 	if err != nil {
@@ -120,28 +119,28 @@ func parseAmount(s string) (int64, error) {
 	return units*minorPerUnit + cents, nil
 }
 
-// MinorUnits returns the amount in minor units.
+// MinorUnits devolve o valor em unidades mínimas.
 func (m Money) MinorUnits() int64 { return m.minor }
 
-// Currency returns the currency.
+// Currency devolve a moeda.
 func (m Money) Currency() Currency { return m.currency }
 
-// IsValid reports whether the value was properly initialized.
+// IsValid informa se o valor foi inicializado corretamente.
 func (m Money) IsValid() bool { return !m.currency.IsZero() }
 
-// IsZero reports whether the amount is zero.
+// IsZero informa se o valor é zero.
 func (m Money) IsZero() bool { return m.minor == 0 }
 
-// IsPositive reports whether the amount is greater than zero.
+// IsPositive informa se o valor é maior que zero.
 func (m Money) IsPositive() bool { return m.minor > 0 }
 
-// IsNegative reports whether the amount is less than zero.
+// IsNegative informa se o valor é menor que zero.
 func (m Money) IsNegative() bool { return m.minor < 0 }
 
-// Equal reports whether both values have the same amount and currency.
+// Equal informa se os dois valores têm o mesmo montante e a mesma moeda.
 func (m Money) Equal(o Money) bool { return m == o }
 
-// Add returns m + o.
+// Add devolve m + o.
 func (m Money) Add(o Money) (Money, error) {
 	if err := m.compatible(o); err != nil {
 		return Money{}, err
@@ -152,7 +151,7 @@ func (m Money) Add(o Money) (Money, error) {
 	return Money{minor: m.minor + o.minor, currency: m.currency}, nil
 }
 
-// Sub returns m - o.
+// Sub devolve m - o.
 func (m Money) Sub(o Money) (Money, error) {
 	if err := m.compatible(o); err != nil {
 		return Money{}, err
@@ -163,7 +162,7 @@ func (m Money) Sub(o Money) (Money, error) {
 	return Money{minor: m.minor - o.minor, currency: m.currency}, nil
 }
 
-// Neg returns -m.
+// Neg devolve -m.
 func (m Money) Neg() (Money, error) {
 	if !m.IsValid() {
 		return Money{}, domain.Errorf(domain.ErrInvalidAmount, "uninitialized money")
@@ -174,7 +173,7 @@ func (m Money) Neg() (Money, error) {
 	return Money{minor: -m.minor, currency: m.currency}, nil
 }
 
-// Cmp returns -1, 0 or +1 comparing m to o.
+// Cmp devolve -1, 0 ou +1 comparando m com o.
 func (m Money) Cmp(o Money) (int, error) {
 	if err := m.compatible(o); err != nil {
 		return 0, err
@@ -199,7 +198,7 @@ func (m Money) compatible(o Money) error {
 	return nil
 }
 
-// Amount formats the amount with exactly two decimals, e.g. "-0.05".
+// Amount formata o valor com exatamente duas casas, por exemplo "-0.05".
 func (m Money) Amount() string {
 	var abs uint64
 	neg := m.minor < 0
@@ -220,7 +219,7 @@ func (m Money) Amount() string {
 	return s
 }
 
-// String returns "<amount> <currency>" for logs and messages.
+// String devolve "<valor> <moeda>" para logs e mensagens.
 func (m Money) String() string {
 	if !m.IsValid() {
 		return "<invalid money>"
@@ -233,7 +232,7 @@ type wire struct {
 	Currency string `json:"currency"`
 }
 
-// MarshalJSON produces {"amount":"25.00","currency":"BRL"}.
+// MarshalJSON produz {"amount":"25.00","currency":"BRL"}.
 func (m Money) MarshalJSON() ([]byte, error) {
 	if !m.IsValid() {
 		return nil, domain.Errorf(domain.ErrInvalidAmount, "uninitialized money")
@@ -241,7 +240,7 @@ func (m Money) MarshalJSON() ([]byte, error) {
 	return json.Marshal(wire{Amount: m.Amount(), Currency: m.currency.String()})
 }
 
-// UnmarshalJSON applies the strict external parsing rules of Parse.
+// UnmarshalJSON aplica as regras estritas de parsing externo de Parse.
 func (m *Money) UnmarshalJSON(b []byte) error {
 	var w wire
 	if err := json.Unmarshal(b, &w); err != nil {

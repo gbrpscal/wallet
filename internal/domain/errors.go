@@ -5,20 +5,20 @@ import (
 	"fmt"
 )
 
-// ErrorKind classifies a domain error so adapters can map it without knowing
-// every individual code.
+// ErrorKind classifica um erro de domínio para que os adaptadores possam
+// mapeá-lo sem conhecer cada código individualmente.
 type ErrorKind int
 
 const (
-	// KindValidation is a correctable input error. Nothing is persisted.
+	// KindValidation é um erro de entrada corrigível. Nada é persistido.
 	KindValidation ErrorKind = iota + 1
-	// KindConflict means the request collides with persisted state
-	// (idempotency key, external transaction, wallet uniqueness).
+	// KindConflict indica colisão com estado persistido (chave de
+	// idempotência, transação externa, unicidade de carteira).
 	KindConflict
-	// KindRejection is a definitive business rejection, persisted as REJECTED.
+	// KindRejection é uma rejeição de negócio definitiva, persistida como REJECTED.
 	KindRejection
-	// KindInvariant means persisted or in-memory state violates an invariant.
-	// It is never caused by client input.
+	// KindInvariant indica que o estado persistido ou em memória viola uma
+	// invariante. Nunca é causado por entrada do cliente.
 	KindInvariant
 )
 
@@ -37,10 +37,10 @@ func (k ErrorKind) String() string {
 	}
 }
 
-// Code is a stable, documented failure code.
+// Code é um código de falha estável e documentado.
 type Code string
 
-// Stable codes. The kind of each one is fixed by its sentinel below.
+// Códigos estáveis. A categoria de cada um é fixada pelo sentinel abaixo.
 const (
 	CodeInvalidRequest         Code = "INVALID_REQUEST"
 	CodeInvalidAmount          Code = "INVALID_AMOUNT"
@@ -66,9 +66,9 @@ const (
 	CodeInvalidTransition      Code = "INVALID_STATE_TRANSITION"
 )
 
-// Error is the single domain error type. Two errors match with errors.Is when
-// they carry the same Code, so the sentinels below work with wrapped values
-// that add a specific message.
+// Error é o único tipo de erro do domínio. Dois erros casam com errors.Is
+// quando têm o mesmo Code, então os sentinels abaixo funcionam também com
+// valores encapsulados que acrescentam uma mensagem específica.
 type Error struct {
 	Kind    ErrorKind
 	Code    Code
@@ -82,7 +82,7 @@ func (e *Error) Error() string {
 	return string(e.Code) + ": " + e.Message
 }
 
-// Is reports whether target is a domain error with the same code.
+// Is informa se target é um erro de domínio com o mesmo código.
 func (e *Error) Is(target error) bool {
 	var t *Error
 	if !errors.As(target, &t) {
@@ -91,7 +91,7 @@ func (e *Error) Is(target error) bool {
 	return t.Code == e.Code
 }
 
-// Sentinels, one per code, for errors.Is.
+// Sentinels, um por código, para uso com errors.Is.
 var (
 	ErrInvalidRequest         = &Error{Kind: KindValidation, Code: CodeInvalidRequest}
 	ErrInvalidAmount          = &Error{Kind: KindValidation, Code: CodeInvalidAmount}
@@ -132,18 +132,18 @@ var byCode = func() map[Code]*Error {
 	return m
 }()
 
-// Errorf returns a copy of the sentinel carrying a specific message.
+// Errorf devolve uma cópia do sentinel com uma mensagem específica.
 func Errorf(sentinel *Error, format string, args ...any) *Error {
 	return &Error{Kind: sentinel.Kind, Code: sentinel.Code, Message: fmt.Sprintf(format, args...)}
 }
 
-// LookupCode returns the sentinel registered for code.
+// LookupCode devolve o sentinel registrado para o código.
 func LookupCode(code Code) (*Error, bool) {
 	e, ok := byCode[code]
 	return e, ok
 }
 
-// KindOf returns the kind of the first domain error in err's chain.
+// KindOf devolve a categoria do primeiro erro de domínio na cadeia de err.
 func KindOf(err error) (ErrorKind, bool) {
 	var e *Error
 	if !errors.As(err, &e) {
@@ -152,7 +152,7 @@ func KindOf(err error) (ErrorKind, bool) {
 	return e.Kind, true
 }
 
-// CodeOf returns the code of the first domain error in err's chain.
+// CodeOf devolve o código do primeiro erro de domínio na cadeia de err.
 func CodeOf(err error) (Code, bool) {
 	var e *Error
 	if !errors.As(err, &e) {

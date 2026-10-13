@@ -93,9 +93,9 @@ func TestValidateTextID(t *testing.T) {
 	}
 }
 
-// TestNoFloatingPointInProductionCode fails if any non-test Go file under
-// internal/ or cmd/ mentions float32 or float64, so money can never pass
-// through a floating point type.
+// TestNoFloatingPointInProductionCode falha se algum arquivo Go de produção em
+// internal/ ou cmd/ mencionar float32 ou float64, para que dinheiro nunca passe
+// por ponto flutuante.
 func TestNoFloatingPointInProductionCode(t *testing.T) {
 	roots := []string{"..", filepath.Join("..", "..", "cmd")}
 	fset := token.NewFileSet()
@@ -122,8 +122,8 @@ func TestNoFloatingPointInProductionCode(t *testing.T) {
 	}
 }
 
-// TestDomainHasNoInfrastructureImports keeps the domain independent of Fx,
-// HTTP, SQS and persistence libraries.
+// TestDomainHasNoInfrastructureImports mantém o domínio independente de Fx,
+// HTTP, SQS e bibliotecas de persistência.
 func TestDomainHasNoInfrastructureImports(t *testing.T) {
 	forbidden := []string{"go.uber.org/fx", "net/http", "github.com/aws/", "github.com/jackc/", "database/sql"}
 	fset := token.NewFileSet()

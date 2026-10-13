@@ -1,7 +1,7 @@
-# Local environment overrides (may contain credentials)
+# Sobrescritas locais de ambiente (podem conter credenciais)
 .env
 
-# Go build and test artifacts
+# Artefatos de build e de teste do Go
 *.test
 *.out
 coverage*

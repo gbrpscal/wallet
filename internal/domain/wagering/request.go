@@ -10,7 +10,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/money"
 )
 
-// RequestInput is the raw provider operation, identical for HTTP and SQS.
+// RequestInput é a operação bruta do provedor, idêntica para HTTP e SQS.
 type RequestInput struct {
 	ProviderID                     string
 	ExternalTransactionID          string
@@ -25,8 +25,8 @@ type RequestInput struct {
 	ReferenceExternalTransactionID string
 }
 
-// Request is a validated provider operation with its idempotency hash.
-// It can only be built by NewRequest.
+// Request é uma operação validada do provedor com seu hash de idempotência.
+// Só pode ser construída por NewRequest.
 type Request struct {
 	providerID          string
 	externalID          string
@@ -41,8 +41,8 @@ type Request struct {
 	hash                PayloadHash
 }
 
-// NewRequest validates the input. Every error is a correctable validation
-// error (KindValidation): nothing is persisted and the key is not consumed.
+// NewRequest valida a entrada. Todo erro é de validação corrigível
+// (KindValidation): nada é persistido e a chave não é consumida.
 func NewRequest(in RequestInput) (Request, error) {
 	for _, f := range []struct{ name, value string }{
 		{"providerId", in.ProviderID},
@@ -117,15 +117,16 @@ func NewRequest(in RequestInput) (Request, error) {
 	return r, nil
 }
 
-// hashVersion prefixes every hash so the field set can evolve without
-// ambiguity with hashes already persisted.
+// hashVersion prefixa todo hash, para que o conjunto de campos possa evoluir
+// sem ambiguidade com os hashes já persistidos.
 const hashVersion = "v1:"
 
-// computeHash is SHA-256 over canonical JSON of the business fields: object
-// keys sorted (encoding/json sorts map keys), no insignificant whitespace,
-// UTF-8, HTML escaping disabled. UUIDs use their canonical lowercase form and
-// the amount its strict two-decimal form. The idempotency key and transport
-// metadata are excluded; referenceExternalTransactionId is omitted when empty.
+// computeHash é SHA-256 sobre o JSON canônico dos campos de negócio: chaves
+// ordenadas (encoding/json ordena as chaves de map), sem espaços
+// insignificantes, UTF-8 e sem escape de HTML. UUIDs na forma canônica
+// minúscula e o valor na forma estrita de duas casas. A chave de idempotência
+// e os metadados de transporte ficam de fora; referenceExternalTransactionId é
+// omitido quando vazio.
 func (r Request) computeHash() (PayloadHash, error) {
 	fields := map[string]any{
 		"providerId":            r.providerID,

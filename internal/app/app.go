@@ -1,7 +1,7 @@
-// Package app holds the use cases and the ports they depend on.
+// Package app contém os casos de uso e as portas de que eles dependem.
 package app
 
 import "go.uber.org/fx"
 
-// Module provides the use cases.
+// Module fornece os casos de uso.
 var Module = fx.Module("app")

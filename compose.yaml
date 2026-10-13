@@ -35,7 +35,7 @@ services:
     ports:
       - "${KEYCLOAK_HOST_PORT:-8180}:8080"
     healthcheck:
-      # The image ships without curl/wget; bash /dev/tcp reaches the management port.
+      # A imagem não tem curl/wget; o /dev/tcp do bash alcança a porta de gerenciamento.
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
       interval: 5s
       timeout: 5s
@@ -85,7 +85,7 @@ services:
       keycloak:
         condition: service_healthy
 
-  # Development toolchain. Only started explicitly: `docker compose run --rm tools <cmd>`.
+  # Toolchain de desenvolvimento. Só sobe explicitamente: `docker compose run --rm tools <cmd>`.
   tools:
     build:
       context: .

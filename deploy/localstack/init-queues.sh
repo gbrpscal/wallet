@@ -1,6 +1,6 @@
 #!/bin/bash
-# Provisions the SQS FIFO queues. Redrive policy, visibility timeout and
-# event destination are added once the messaging parameters are defined.
+# Provisiona as filas SQS FIFO. Política de redrive, visibility timeout e
+# destino dos eventos entram quando os parâmetros de mensageria forem definidos.
 set -euo pipefail
 
 awslocal sqs create-queue \

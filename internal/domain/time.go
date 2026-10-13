@@ -2,8 +2,9 @@ package domain
 
 import "time"
 
-// Timestamp normalizes instants to UTC with microsecond precision, the
-// precision PostgreSQL stores, so persisted and in-memory values are equal.
+// Timestamp normaliza instantes para UTC com precisão de microssegundos, a
+// mesma que o PostgreSQL armazena, para que valores persistidos e em memória
+// sejam iguais.
 func Timestamp(t time.Time) time.Time {
 	return t.UTC().Truncate(time.Microsecond)
 }

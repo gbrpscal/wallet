@@ -23,7 +23,7 @@ var (
 	trace    = event.Trace{CorrelationID: "corr-1"}
 )
 
-// input returns the example BET from the specification; opts adjust it.
+// input devolve a BET de exemplo do enunciado; opts a ajustam.
 func input(opts ...func(*wagering.RequestInput)) wagering.RequestInput {
 	in := wagering.RequestInput{
 		ProviderID:            "provider-a",
@@ -90,7 +90,7 @@ func openWallet(t *testing.T, initial string) *wallet.Wallet {
 	return w
 }
 
-// processed runs tx against w and requires it to end PROCESSED.
+// processed executa tx sobre w e exige que termine PROCESSED.
 func processed(t *testing.T, tx *wagering.WagerTransaction, w *wallet.Wallet, ref wagering.Reference) wagering.Outcome {
 	t.Helper()
 	out, err := wagering.Process(tx, w, ref, trace, t0.Add(time.Second))

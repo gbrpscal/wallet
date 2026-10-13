@@ -1,4 +1,4 @@
-// Package logging builds the structured JSON logger shared by the process.
+// Package logging constrói o logger JSON estruturado compartilhado pelo processo.
 package logging
 
 import (
@@ -11,17 +11,17 @@ import (
 	"github.com/gbrpscal/wallet/internal/platform/config"
 )
 
-// Module provides the process-wide *slog.Logger.
+// Module fornece o *slog.Logger do processo.
 var Module = fx.Module("logging",
 	fx.Provide(New),
 )
 
-// New returns a JSON logger writing to stdout at the configured level.
+// New devolve um logger JSON que escreve no stdout no nível configurado.
 func New(cfg config.Config) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 }
 
-// FxLogger routes Fx lifecycle events through the application logger.
+// FxLogger encaminha os eventos de ciclo de vida do Fx pelo logger da aplicação.
 func FxLogger(l *slog.Logger) fxevent.Logger {
 	return &fxevent.SlogLogger{Logger: l.With("component", "fx")}
 }

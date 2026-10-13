@@ -1,6 +1,6 @@
-// Package event defines the integration events written to the outbox. Each
-// concrete event fixes its own type and version in its constructor, and its
-// payload is an immutable snapshot taken at creation time.
+// Package event define os eventos de integração gravados na outbox. Cada
+// evento concreto fixa seu tipo e sua versão no construtor, e o payload é um
+// snapshot imutável tirado no momento da criação.
 package event
 
 import (
@@ -12,7 +12,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/wallet"
 )
 
-// Event types.
+// Tipos de evento.
 const (
 	TypeWagerTransactionProcessed        = "WagerTransactionProcessed"
 	TypeWagerTransactionRejected         = "WagerTransactionRejected"
@@ -20,16 +20,16 @@ const (
 	TypeWagerTransactionPendingReference = "WagerTransactionPendingReference"
 )
 
-// TimeLayout is RFC 3339 in UTC with fixed microsecond precision.
+// TimeLayout é RFC 3339 em UTC com precisão fixa de microssegundos.
 const TimeLayout = "2006-01-02T15:04:05.000000Z07:00"
 
-// Trace links an event to the request or message that caused it.
+// Trace liga um evento à requisição ou mensagem que o causou.
 type Trace struct {
 	CorrelationID string
 	CausationID   string
 }
 
-// Validate requires a correlation id; the causation id is optional.
+// Validate exige o correlation id; o causation id é opcional.
 func (t Trace) Validate() error {
 	if err := domain.ValidateTextID("correlationId", t.CorrelationID); err != nil {
 		return err
@@ -40,7 +40,7 @@ func (t Trace) Validate() error {
 	return nil
 }
 
-// Event is implemented by every concrete event.
+// Event é implementado por todo evento concreto.
 type Event interface {
 	ID() domain.EventID
 	Type() string
@@ -92,7 +92,7 @@ func (h header) CorrelationID() string { return h.correlationID }
 func (h header) CausationID() string   { return h.causationID }
 func (h header) OccurredAt() time.Time { return h.occurredAt }
 
-// envelope is the wire format published to consumers.
+// envelope é o formato publicado para os consumidores.
 type envelope struct {
 	EventID       string `json:"eventId"`
 	EventType     string `json:"eventType"`
@@ -104,8 +104,8 @@ type envelope struct {
 	Data          any    `json:"data"`
 }
 
-// Marshal serializes the event envelope. The result is what the outbox stores
-// and what gets published, unchanged, on every attempt.
+// Marshal serializa o envelope do evento. O resultado é o que a outbox
+// armazena e o que é publicado, sem alteração, em toda tentativa.
 func Marshal(e Event) ([]byte, error) {
 	return json.Marshal(envelope{
 		EventID:       e.ID().String(),
@@ -119,8 +119,8 @@ func Marshal(e Event) ([]byte, error) {
 	})
 }
 
-// TransactionRef identifies the wager transaction an event is about. External
-// fields are empty, and omitted, for the internal OPENING transaction.
+// TransactionRef identifica a transação de wagering de que o evento trata. Os
+// campos externos ficam vazios, e são omitidos, na transação interna OPENING.
 type TransactionRef struct {
 	TransactionID         domain.TransactionID `json:"transactionId"`
 	WalletID              domain.WalletID      `json:"walletId"`
@@ -133,21 +133,21 @@ type TransactionRef struct {
 	GameID                string               `json:"gameId,omitempty"`
 }
 
-// WagerTransactionProcessedData is the payload of WagerTransactionProcessed.
+// WagerTransactionProcessedData é o payload de WagerTransactionProcessed.
 type WagerTransactionProcessedData struct {
 	TransactionRef
 	ReferenceTransactionID string      `json:"referenceTransactionId,omitempty"`
 	Balance                money.Money `json:"balance"`
 }
 
-// WagerTransactionProcessed is emitted on every successful completion,
-// including LOSS and the internal OPENING.
+// WagerTransactionProcessed é emitido em toda conclusão bem-sucedida,
+// incluindo LOSS e o OPENING interno.
 type WagerTransactionProcessed struct {
 	header
 	data WagerTransactionProcessedData
 }
 
-// NewWagerTransactionProcessed builds version 1 of the event.
+// NewWagerTransactionProcessed constrói a versão 1 do evento.
 func NewWagerTransactionProcessed(trace Trace, now time.Time, d WagerTransactionProcessedData) (WagerTransactionProcessed, error) {
 	h, err := newHeader(TypeWagerTransactionProcessed, 1, d.TransactionID.String(), trace, now)
 	if err != nil {
@@ -156,26 +156,26 @@ func NewWagerTransactionProcessed(trace Trace, now time.Time, d WagerTransaction
 	return WagerTransactionProcessed{header: h, data: d}, nil
 }
 
-// Data returns the typed payload.
+// Data devolve o payload tipado.
 func (e WagerTransactionProcessed) Data() any { return e.data }
 
-// Payload returns the typed payload.
+// Payload devolve o payload tipado.
 func (e WagerTransactionProcessed) Payload() WagerTransactionProcessedData { return e.data }
 
-// WagerTransactionRejectedData is the payload of WagerTransactionRejected.
+// WagerTransactionRejectedData é o payload de WagerTransactionRejected.
 type WagerTransactionRejectedData struct {
 	TransactionRef
 	ReferenceExternalTransactionID string      `json:"referenceExternalTransactionId,omitempty"`
 	FailureCode                    domain.Code `json:"failureCode"`
 }
 
-// WagerTransactionRejected is emitted on a definitive business rejection.
+// WagerTransactionRejected é emitido em uma rejeição de negócio definitiva.
 type WagerTransactionRejected struct {
 	header
 	data WagerTransactionRejectedData
 }
 
-// NewWagerTransactionRejected builds version 1 of the event.
+// NewWagerTransactionRejected constrói a versão 1 do evento.
 func NewWagerTransactionRejected(trace Trace, now time.Time, d WagerTransactionRejectedData) (WagerTransactionRejected, error) {
 	h, err := newHeader(TypeWagerTransactionRejected, 1, d.TransactionID.String(), trace, now)
 	if err != nil {
@@ -184,27 +184,27 @@ func NewWagerTransactionRejected(trace Trace, now time.Time, d WagerTransactionR
 	return WagerTransactionRejected{header: h, data: d}, nil
 }
 
-// Data returns the typed payload.
+// Data devolve o payload tipado.
 func (e WagerTransactionRejected) Data() any { return e.data }
 
-// Payload returns the typed payload.
+// Payload devolve o payload tipado.
 func (e WagerTransactionRejected) Payload() WagerTransactionRejectedData { return e.data }
 
-// WagerTransactionPendingReferenceData is the payload of
+// WagerTransactionPendingReferenceData é o payload de
 // WagerTransactionPendingReference.
 type WagerTransactionPendingReferenceData struct {
 	TransactionRef
 	ReferenceExternalTransactionID string `json:"referenceExternalTransactionId"`
 }
 
-// WagerTransactionPendingReference is emitted when an operation starts
-// waiting for its reference.
+// WagerTransactionPendingReference é emitido quando uma operação passa a
+// esperar pela sua referência.
 type WagerTransactionPendingReference struct {
 	header
 	data WagerTransactionPendingReferenceData
 }
 
-// NewWagerTransactionPendingReference builds version 1 of the event.
+// NewWagerTransactionPendingReference constrói a versão 1 do evento.
 func NewWagerTransactionPendingReference(trace Trace, now time.Time, d WagerTransactionPendingReferenceData) (WagerTransactionPendingReference, error) {
 	h, err := newHeader(TypeWagerTransactionPendingReference, 1, d.TransactionID.String(), trace, now)
 	if err != nil {
@@ -213,15 +213,15 @@ func NewWagerTransactionPendingReference(trace Trace, now time.Time, d WagerTran
 	return WagerTransactionPendingReference{header: h, data: d}, nil
 }
 
-// Data returns the typed payload.
+// Data devolve o payload tipado.
 func (e WagerTransactionPendingReference) Data() any { return e.data }
 
-// Payload returns the typed payload.
+// Payload devolve o payload tipado.
 func (e WagerTransactionPendingReference) Payload() WagerTransactionPendingReferenceData {
 	return e.data
 }
 
-// WalletBalanceChangedData is the payload of WalletBalanceChanged.
+// WalletBalanceChangedData é o payload de WalletBalanceChanged.
 type WalletBalanceChangedData struct {
 	WalletID      domain.WalletID      `json:"walletId"`
 	TransactionID domain.TransactionID `json:"transactionId"`
@@ -232,14 +232,14 @@ type WalletBalanceChangedData struct {
 	WalletVersion int64                `json:"walletVersion"`
 }
 
-// WalletBalanceChanged is emitted for every effective balance change.
+// WalletBalanceChanged é emitido em toda alteração efetiva de saldo.
 type WalletBalanceChanged struct {
 	header
 	data WalletBalanceChangedData
 }
 
-// NewWalletBalanceChanged builds version 1 of the event from a ledger entry
-// and the wallet version that entry produced.
+// NewWalletBalanceChanged constrói a versão 1 do evento a partir de um
+// lançamento e da versão de carteira que esse lançamento produziu.
 func NewWalletBalanceChanged(trace Trace, now time.Time, entry wallet.LedgerEntry, walletVersion int64) (WalletBalanceChanged, error) {
 	d := WalletBalanceChangedData{
 		WalletID:      entry.WalletID(),
@@ -257,8 +257,8 @@ func NewWalletBalanceChanged(trace Trace, now time.Time, entry wallet.LedgerEntr
 	return WalletBalanceChanged{header: h, data: d}, nil
 }
 
-// Data returns the typed payload.
+// Data devolve o payload tipado.
 func (e WalletBalanceChanged) Data() any { return e.data }
 
-// Payload returns the typed payload.
+// Payload devolve o payload tipado.
 func (e WalletBalanceChanged) Payload() WalletBalanceChangedData { return e.data }

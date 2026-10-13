@@ -1,4 +1,4 @@
-// Command wallet runs the HTTP API and the background workers.
+// Command wallet executa a API HTTP e os workers em segundo plano.
 package main
 
 import (

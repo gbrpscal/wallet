@@ -1,5 +1,5 @@
-// Package health defines readiness checks contributed by infrastructure
-// adapters and collected through an Fx value group.
+// Package health define as checagens de readiness fornecidas pelos
+// adaptadores de infraestrutura e reunidas por um value group do Fx.
 package health
 
 import (
@@ -8,13 +8,13 @@ import (
 	"go.uber.org/fx"
 )
 
-// Checker reports whether one dependency is ready to serve traffic.
+// Checker informa se uma dependência está pronta para atender tráfego.
 type Checker interface {
 	Name() string
 	Check(ctx context.Context) error
 }
 
-// AsChecker annotates a constructor so its result joins the readiness group.
+// AsChecker anota um construtor para que o resultado entre no grupo de readiness.
 func AsChecker(constructor any) any {
 	return fx.Annotate(constructor,
 		fx.As(new(Checker)),
@@ -22,14 +22,14 @@ func AsChecker(constructor any) any {
 	)
 }
 
-// CheckerFunc adapts a function to the Checker interface.
+// CheckerFunc adapta uma função à interface Checker.
 type CheckerFunc struct {
 	CheckName string
 	Fn        func(ctx context.Context) error
 }
 
-// Name returns the dependency name.
+// Name devolve o nome da dependência.
 func (c CheckerFunc) Name() string { return c.CheckName }
 
-// Check runs the underlying function.
+// Check executa a função subjacente.
 func (c CheckerFunc) Check(ctx context.Context) error { return c.Fn(ctx) }

@@ -94,8 +94,8 @@ func TestRequestFieldValidation(t *testing.T) {
 	}
 }
 
-// TestHashCanonicalVector pins the algorithm: SHA-256 over canonical JSON
-// with sorted keys and no whitespace, prefixed with the version.
+// TestHashCanonicalVector fixa o algoritmo: SHA-256 sobre JSON canônico com
+// chaves ordenadas e sem espaços, prefixado pela versão.
 func TestHashCanonicalVector(t *testing.T) {
 	canonical := `{"externalTransactionId":"transaction-123","gameId":"fortune-chimp","kind":"BET",` +
 		`"money":{"amount":"25.00","currency":"BRL"},"playerId":"` + playerStr + `",` +

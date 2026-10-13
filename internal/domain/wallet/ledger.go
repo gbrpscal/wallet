@@ -7,7 +7,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/money"
 )
 
-// Direction of a ledger entry from the wallet's point of view.
+// Direction é a direção de um lançamento, do ponto de vista da carteira.
 type Direction string
 
 const (
@@ -15,7 +15,7 @@ const (
 	Credit Direction = "CREDIT"
 )
 
-// ParseDirection validates a persisted direction.
+// ParseDirection valida uma direção persistida.
 func ParseDirection(s string) (Direction, error) {
 	switch d := Direction(s); d {
 	case Debit, Credit:
@@ -25,8 +25,8 @@ func ParseDirection(s string) (Direction, error) {
 	}
 }
 
-// LedgerEntry is an immutable record of one balance change. It can only be
-// built with balanceAfter = balanceBefore ± amount.
+// LedgerEntry é o registro imutável de uma mudança de saldo. Só pode ser
+// construído com balanceAfter = balanceBefore ± amount.
 type LedgerEntry struct {
 	id            domain.LedgerEntryID
 	walletID      domain.WalletID
@@ -38,8 +38,8 @@ type LedgerEntry struct {
 	createdAt     time.Time
 }
 
-// LedgerEntrySnapshot carries every field of an entry, for reconstruction
-// from persistence.
+// LedgerEntrySnapshot carrega todos os campos de um lançamento, para
+// reconstrução a partir da persistência.
 type LedgerEntrySnapshot struct {
 	ID            domain.LedgerEntryID
 	WalletID      domain.WalletID
@@ -51,8 +51,8 @@ type LedgerEntrySnapshot struct {
 	CreatedAt     time.Time
 }
 
-// NewLedgerEntry validates and builds an entry. Any inconsistency is an
-// invariant violation, never a client error.
+// NewLedgerEntry valida e constrói um lançamento. Qualquer inconsistência é
+// violação de invariante, nunca erro do cliente.
 func NewLedgerEntry(s LedgerEntrySnapshot) (LedgerEntry, error) {
 	if s.ID.IsZero() || s.WalletID.IsZero() || s.TransactionID.IsZero() {
 		return LedgerEntry{}, domain.Errorf(domain.ErrInconsistentState, "ledger entry requires id, wallet and transaction")
@@ -104,8 +104,8 @@ func (e LedgerEntry) BalanceBefore() money.Money          { return e.balanceBefo
 func (e LedgerEntry) BalanceAfter() money.Money           { return e.balanceAfter }
 func (e LedgerEntry) CreatedAt() time.Time                { return e.createdAt }
 
-// SignedAmount returns +amount for credits and -amount for debits, used by
-// reconciliation.
+// SignedAmount devolve +amount para créditos e -amount para débitos; usado na
+// reconciliação.
 func (e LedgerEntry) SignedAmount() (money.Money, error) {
 	if e.direction == Credit {
 		return e.amount, nil

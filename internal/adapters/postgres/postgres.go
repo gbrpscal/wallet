@@ -1,4 +1,4 @@
-// Package postgres provides the PostgreSQL connection pool and repositories.
+// Package postgres fornece o pool de conexões PostgreSQL e os repositórios.
 package postgres
 
 import (
@@ -12,7 +12,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/platform/health"
 )
 
-// Module provides the connection pool and its readiness check.
+// Module fornece o pool de conexões e sua checagem de readiness.
 var Module = fx.Module("postgres",
 	fx.Provide(
 		NewPool,
@@ -20,10 +20,10 @@ var Module = fx.Module("postgres",
 	),
 )
 
-// NewPool creates the pool. Connections are opened lazily, so a database that
-// is temporarily unavailable at startup does not prevent the process from
-// starting; readiness reports it instead. The pool is closed on stop, after
-// every component that depends on it has stopped.
+// NewPool cria o pool. As conexões são abertas sob demanda, então um banco
+// temporariamente indisponível na partida não impede o processo de subir; a
+// readiness é que reporta a indisponibilidade. O pool é fechado no stop, depois
+// que todos os componentes que dependem dele pararam.
 func NewPool(lc fx.Lifecycle, cfg config.Config) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
@@ -37,7 +37,7 @@ func NewPool(lc fx.Lifecycle, cfg config.Config) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// NewReadinessCheck pings the database.
+// NewReadinessCheck faz ping no banco.
 func NewReadinessCheck(pool *pgxpool.Pool) health.CheckerFunc {
 	return health.CheckerFunc{CheckName: "postgres", Fn: pool.Ping}
 }

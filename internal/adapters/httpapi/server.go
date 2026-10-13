@@ -1,4 +1,4 @@
-// Package httpapi exposes the HTTP API using net/http.
+// Package httpapi expõe a API HTTP usando net/http.
 package httpapi
 
 import (
@@ -14,7 +14,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/platform/config"
 )
 
-// Module provides the router, the health handlers and the HTTP server.
+// Module fornece o roteador, os handlers de health e o servidor HTTP.
 var Module = fx.Module("httpapi",
 	fx.Provide(
 		NewHealthHandler,
@@ -23,7 +23,7 @@ var Module = fx.Module("httpapi",
 	fx.Invoke(StartServer),
 )
 
-// NewMux registers every route.
+// NewMux registra todas as rotas.
 func NewMux(h *HealthHandler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", h.Live)
@@ -31,8 +31,9 @@ func NewMux(h *HealthHandler) *http.ServeMux {
 	return mux
 }
 
-// StartServer binds the listener during start, so a busy port fails the
-// startup, and drains in-flight requests on stop within the Fx stop deadline.
+// StartServer abre o listener durante o start, para que uma porta ocupada
+// faça a inicialização falhar, e drena as requisições em andamento no stop,
+// dentro do prazo de parada do Fx.
 func StartServer(lc fx.Lifecycle, cfg config.Config, mux *http.ServeMux, health *HealthHandler, log *slog.Logger) {
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

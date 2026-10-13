@@ -1,5 +1,5 @@
-// Package config loads and validates the process configuration from
-// environment variables.
+// Package config carrega e valida a configuração do processo a partir das
+// variáveis de ambiente.
 package config
 
 import (
@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// Config holds every setting the process needs. Credentials for AWS are not
-// part of it: the AWS SDK reads them directly from the environment so they
-// never travel through application structs or logs.
+// Config reúne todas as configurações de que o processo precisa. As
+// credenciais da AWS não fazem parte dela: o SDK da AWS as lê direto do
+// ambiente, para que nunca passem por structs da aplicação nem por logs.
 type Config struct {
 	HTTPAddr          string
 	DatabaseURL       string
@@ -27,7 +27,7 @@ type Config struct {
 	HTTPHeaderTimeout time.Duration
 }
 
-// Load reads the environment and returns a validated Config.
+// Load lê o ambiente e devolve um Config validado.
 func Load() (Config, error) {
 	var errs []error
 

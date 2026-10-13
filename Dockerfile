@@ -2,8 +2,8 @@
 
 ARG GO_VERSION=1.27.2
 
-# Toolchain used for development commands (build, test, vet, migrations).
-# CGO stays enabled so that `go test -race` works.
+# Toolchain dos comandos de desenvolvimento (build, test, vet, migrations).
+# CGO fica habilitado para que `go test -race` funcione.
 FROM golang:${GO_VERSION}-bookworm AS tools
 ARG GOOSE_VERSION=v3.29.0
 ENV CGO_ENABLED=1 \

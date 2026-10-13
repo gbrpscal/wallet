@@ -1,5 +1,5 @@
-// Package wagering holds the WagerTransaction entity, the validated external
-// request and the rules that turn a request into financial outcomes.
+// Package wagering contém a entidade WagerTransaction, a requisição externa
+// validada e as regras que transformam uma requisição em resultado financeiro.
 package wagering
 
 import (
@@ -9,7 +9,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/money"
 )
 
-// Kind of a wager transaction.
+// Kind é o tipo de uma transação de wagering.
 type Kind string
 
 const (
@@ -21,8 +21,8 @@ const (
 	Rollback Kind = "ROLLBACK"
 )
 
-// ParseExternalKind accepts the kinds a provider may send. OPENING is
-// internal and rejected with KIND_NOT_ALLOWED, like any unknown kind.
+// ParseExternalKind aceita os tipos que um provedor pode enviar. OPENING é
+// interno e rejeitado com KIND_NOT_ALLOWED, como qualquer tipo desconhecido.
 func ParseExternalKind(s string) (Kind, error) {
 	switch k := Kind(s); k {
 	case Bet, Win, Loss, Refund, Rollback:
@@ -32,7 +32,7 @@ func ParseExternalKind(s string) (Kind, error) {
 	}
 }
 
-// ParseKind validates a persisted kind.
+// ParseKind valida um tipo persistido.
 func ParseKind(s string) (Kind, error) {
 	switch k := Kind(s); k {
 	case Opening, Bet, Win, Loss, Refund, Rollback:
@@ -42,10 +42,10 @@ func ParseKind(s string) (Kind, error) {
 	}
 }
 
-// IsReversal reports whether the kind undoes a referenced transaction.
+// IsReversal informa se o tipo desfaz uma transação referenciada.
 func (k Kind) IsReversal() bool { return k == Refund || k == Rollback }
 
-// Status of a wager transaction.
+// Status é o estado de uma transação de wagering.
 type Status string
 
 const (
@@ -56,7 +56,7 @@ const (
 	Failed           Status = "FAILED"
 )
 
-// ParseStatus validates a persisted status.
+// ParseStatus valida um estado persistido.
 func ParseStatus(s string) (Status, error) {
 	switch st := Status(s); st {
 	case Pending, PendingReference, Processed, Rejected, Failed:
@@ -66,20 +66,20 @@ func ParseStatus(s string) (Status, error) {
 	}
 }
 
-// IsTerminal reports whether no further transition is allowed.
+// IsTerminal informa se nenhuma outra transição é permitida.
 func (s Status) IsTerminal() bool { return s == Processed || s == Rejected || s == Failed }
 
-// transitions is the whole state machine:
+// transitions é a máquina de estados completa:
 //
 //	PENDING           -> PROCESSED | REJECTED | FAILED | PENDING_REFERENCE
 //	PENDING_REFERENCE -> PROCESSED | REJECTED | FAILED
-//	PROCESSED, REJECTED, FAILED: terminal
+//	PROCESSED, REJECTED, FAILED: terminais
 var transitions = map[Status][]Status{
 	Pending:          {Processed, Rejected, Failed, PendingReference},
 	PendingReference: {Processed, Rejected, Failed},
 }
 
-// CanTransition reports whether from -> to is allowed.
+// CanTransition informa se a transição from -> to é permitida.
 func CanTransition(from, to Status) bool {
 	for _, s := range transitions[from] {
 		if s == to {
@@ -89,11 +89,12 @@ func CanTransition(from, to Status) bool {
 	return false
 }
 
-// PayloadHash is the versioned idempotency hash of the business fields.
+// PayloadHash é o hash de idempotência versionado dos campos de negócio.
 type PayloadHash string
 
-// WagerTransaction records one operation on a wallet. External operations
-// carry provider metadata; the internal OPENING carries none.
+// WagerTransaction registra uma operação sobre uma carteira. Operações
+// externas carregam os metadados do provedor; o OPENING interno não carrega
+// nenhum.
 type WagerTransaction struct {
 	id       domain.TransactionID
 	kind     Kind
@@ -118,8 +119,8 @@ type WagerTransaction struct {
 	updatedAt time.Time
 }
 
-// Snapshot carries every field, for reconstruction from persistence.
-// ResultBalance is the zero Money when absent.
+// Snapshot carrega todos os campos, para reconstrução a partir da
+// persistência. ResultBalance é o Money zero quando ausente.
 type Snapshot struct {
 	ID                             domain.TransactionID
 	Kind                           Kind
@@ -141,7 +142,7 @@ type Snapshot struct {
 	UpdatedAt                      time.Time
 }
 
-// NewExternal registers a validated provider request as PENDING.
+// NewExternal registra uma requisição validada do provedor como PENDING.
 func NewExternal(req Request, now time.Time) (*WagerTransaction, error) {
 	if req.hash == "" {
 		return nil, domain.Errorf(domain.ErrInvalidRequest, "request was not built with NewRequest")
@@ -173,8 +174,8 @@ func NewExternal(req Request, now time.Time) (*WagerTransaction, error) {
 	}, nil
 }
 
-// newOpening creates the internal OPENING transaction as PENDING; the caller
-// completes it in the same operation that opens the wallet.
+// newOpening cria a transação interna OPENING como PENDING; quem chama a
+// conclui na mesma operação que abre a carteira.
 func newOpening(id domain.TransactionID, walletID domain.WalletID, playerID domain.PlayerID, amount money.Money, now time.Time) (*WagerTransaction, error) {
 	if id.IsZero() || walletID.IsZero() || playerID.IsZero() {
 		return nil, domain.Errorf(domain.ErrInconsistentState, "opening requires ids")
@@ -195,7 +196,7 @@ func newOpening(id domain.TransactionID, walletID domain.WalletID, playerID doma
 	}, nil
 }
 
-// Rehydrate rebuilds a persisted transaction without running any transition.
+// Rehydrate reconstrói uma transação persistida sem executar nenhuma transição.
 func Rehydrate(s Snapshot) (*WagerTransaction, error) {
 	t := &WagerTransaction{
 		id:                  s.ID,
@@ -306,8 +307,8 @@ func isCode(code domain.Code, kind domain.ErrorKind) bool {
 	return ok && e.Kind == kind
 }
 
-// MarkPendingReference records that the referenced transaction is not yet
-// available. Only reversals wait.
+// MarkPendingReference registra que a transação referenciada ainda não está
+// disponível. Somente reversões esperam.
 func (t *WagerTransaction) MarkPendingReference(now time.Time) error {
 	if !t.kind.IsReversal() {
 		return domain.Errorf(domain.ErrInvalidTransition, "%s cannot wait for a reference", t.kind)
@@ -315,10 +316,10 @@ func (t *WagerTransaction) MarkPendingReference(now time.Time) error {
 	return t.transition(PendingReference, now)
 }
 
-// MarkProcessed completes the transaction. balance is the wallet balance
-// observed right after processing, returned on every replay; ref is the
-// resolved referenced transaction (required for reversals, optional for WIN,
-// forbidden otherwise).
+// MarkProcessed conclui a transação. balance é o saldo da carteira observado
+// logo após o processamento, devolvido em todo replay; ref é a transação
+// referenciada já resolvida (obrigatória em reversões, opcional em WIN,
+// proibida nos demais tipos).
 func (t *WagerTransaction) MarkProcessed(balance money.Money, ref domain.TransactionID, now time.Time) error {
 	if !balance.IsValid() || balance.IsNegative() || balance.Currency() != t.money.Currency() {
 		return domain.Errorf(domain.ErrInconsistentState, "invalid result balance")
@@ -337,8 +338,8 @@ func (t *WagerTransaction) MarkProcessed(balance money.Money, ref domain.Transac
 	return nil
 }
 
-// MarkRejected records a definitive business rejection. observed is the
-// wallet balance at rejection time, or the zero Money when unknown.
+// MarkRejected registra uma rejeição de negócio definitiva. observed é o
+// saldo da carteira no momento da rejeição, ou o Money zero quando desconhecido.
 func (t *WagerTransaction) MarkRejected(code domain.Code, observed money.Money, now time.Time) error {
 	if !isCode(code, domain.KindRejection) {
 		return domain.Errorf(domain.ErrInconsistentState, "%q is not a rejection code", code)
@@ -354,7 +355,7 @@ func (t *WagerTransaction) MarkRejected(code domain.Code, observed money.Money, 
 	return nil
 }
 
-// MarkFailed records a permanent failure for audit.
+// MarkFailed registra uma falha permanente para auditoria.
 func (t *WagerTransaction) MarkFailed(code domain.Code, now time.Time) error {
 	if !isCode(code, domain.KindInvariant) {
 		return domain.Errorf(domain.ErrInconsistentState, "%q is not a permanent failure code", code)
@@ -380,10 +381,10 @@ func (t *WagerTransaction) transition(to Status, now time.Time) error {
 	return nil
 }
 
-// CheckReplay compares a new request with this persisted transaction, found
-// either by (providerId, idempotencyKey) or by (providerId,
-// externalTransactionId). A nil result means the request is an idempotent
-// replay and the persisted result must be returned without reapplying.
+// CheckReplay compara uma nova requisição com esta transação persistida,
+// encontrada por (providerId, idempotencyKey) ou por (providerId,
+// externalTransactionId). Resultado nil significa replay idempotente: o
+// resultado persistido deve ser devolvido sem reaplicar a operação.
 func (t *WagerTransaction) CheckReplay(req Request) error {
 	if t.kind == Opening || t.providerID != req.providerID {
 		return domain.Errorf(domain.ErrInconsistentState, "replay lookup crossed provider or internal scope")
@@ -418,17 +419,17 @@ func (t *WagerTransaction) ReferenceExternalTransactionID() string {
 	return t.referenceExternalID
 }
 
-// ReferenceTransactionID returns the resolved reference, if any.
+// ReferenceTransactionID devolve a referência resolvida, se houver.
 func (t *WagerTransaction) ReferenceTransactionID() (domain.TransactionID, bool) {
 	return t.referenceTxID, !t.referenceTxID.IsZero()
 }
 
-// ResultBalance returns the balance observed when the transaction concluded.
+// ResultBalance devolve o saldo observado quando a transação foi concluída.
 func (t *WagerTransaction) ResultBalance() (money.Money, bool) {
 	return t.resultBalance, t.resultBalance.IsValid()
 }
 
-// Snapshot exports every field for persistence.
+// Snapshot exporta todos os campos para persistência.
 func (t *WagerTransaction) Snapshot() Snapshot {
 	return Snapshot{
 		ID:                             t.id,
