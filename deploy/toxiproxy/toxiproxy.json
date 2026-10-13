@@ -1,0 +1,14 @@
+[
+  {
+    "name": "postgres",
+    "listen": "0.0.0.0:15432",
+    "upstream": "postgres:5432",
+    "enabled": true
+  },
+  {
+    "name": "sqs",
+    "listen": "0.0.0.0:14566",
+    "upstream": "localstack:4566",
+    "enabled": true
+  }
+]
