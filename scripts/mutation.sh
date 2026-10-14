@@ -21,6 +21,8 @@
 #
 # MUTATION_FILTER (expressão regular) roda só os mutantes cujo nome casar, por
 # exemplo: MUTATION_FILTER="inbox|DLQ" bash scripts/mutation.sh
+#
+# MUTATION_RESILIENCE=1 inclui o grupo de resiliência (3 processos reais).
 set -u
 
 SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -37,8 +39,10 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-120s}"
 # baseline <pacotes> [tags]: os testes precisam passar sem mutação.
 baseline() {
   local pkgs="$1" tags="${2:-}"
-  if ! (cd "$SRC" && go test -count=1 -timeout "$TEST_TIMEOUT" ${tags:+-tags=$tags} $pkgs >/dev/null 2>&1); then
+  local out
+  if ! out=$(cd "$SRC" && go test -count=1 -timeout "$TEST_TIMEOUT" ${tags:+-tags=$tags} $pkgs 2>&1); then
     echo "ERROR    linha de base falhou para $pkgs ${tags:+(tags: $tags)}; corrija o ambiente antes"
+    echo "$out" | tail -20
     exit 1
   fi
 }
@@ -394,6 +398,40 @@ mutate "componente duplicado no log do refresher" internal/worker/worker.go \
   'base := log
 	log = log.With("component", "gauge-refresher")' 'base := log.With("component", "gauge-refresher")
 	log = log.With("component", "gauge-refresher")' $WK integration
+
+# --- Composição Fx (tag integration; exige PostgreSQL, Keycloak e LocalStack no ar) ---
+FX=./internal/bootstrap/...
+baseline $FX integration
+
+mutate "pool do banco nunca é fechado" internal/adapters/postgres/postgres.go \
+  'lc.Append(fx.StopHook(pool.Close))' '_ = pool.Close' $FX integration
+mutate "consumidor sem hook de stop" internal/adapters/sqs/sqs.go \
+  'lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})' 'lc.Append(fx.Hook{OnStart: c.Start})' $FX integration
+mutate "servidor HTTP não para no stop" internal/adapters/httpapi/server.go \
+  'return srv.Shutdown(ctx)' 'return nil' $FX integration
+mutate "publisher da outbox sem hook de stop" internal/worker/worker.go \
+  'lc.Append(fx.Hook{OnStart: l.Start, OnStop: l.Stop})
+	return nil' 'lc.Append(fx.Hook{OnStart: l.Start})
+	return nil' $FX integration
+
+# --- Resiliência com 3 processos (tag resilience; opcional, leva alguns minutos) ----
+# Cada mutante roda só o cenário que o detecta. Exige toda a stack do Compose,
+# inclusive o Toxiproxy. Ative com MUTATION_RESILIENCE=1.
+if [ "${MUTATION_RESILIENCE:-0}" = "1" ]; then
+  RS=./test/resilience/
+  baseline "-run ^(TestBurstOnOneWalletAcrossInstances|TestHTTPAndSQSAcrossInstances|TestDatabaseOutage|TestBrokerOutage)$ $RS" resilience
+
+  mutate "multi-instância: lock da carteira sem FOR UPDATE" internal/adapters/postgres/wallets.go \
+    'FROM wallets WHERE id = $1 FOR UPDATE`' 'FROM wallets WHERE id = $1`' \
+    "-run ^TestBurstOnOneWalletAcrossInstances$ $RS" resilience
+  mutate "multi-instância: inbox não barra a reentrega" internal/app/service.go \
+    'if !inserted {' 'if false && !inserted {' "-run ^TestHTTPAndSQSAcrossInstances$ $RS" resilience
+  mutate "queda do banco manda mensagens para a DLQ" internal/adapters/sqs/consumer.go \
+    'if permanent(err) {' 'if true {' "-run ^TestDatabaseOutage$ $RS" resilience
+  mutate "falha do broker marcada como publicada" internal/app/outbox.go \
+    'if err := r.publisher.Publish(ctx, e); err != nil {' 'if err := r.publisher.Publish(ctx, e); err != nil && false {' \
+    "-run ^TestBrokerOutage$ $RS" resilience
+fi
 
 echo
 echo "mutantes mortos: $killed, problemas: $bad"

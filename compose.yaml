@@ -147,6 +147,8 @@ services:
       OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
       OIDC_TOKEN_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/token
       OIDC_AUDIENCE: wallet-api
+      # API do Toxiproxy, usada pelos testes de resiliência.
+      TOXIPROXY_URL: http://toxiproxy:8474
       # Comandos do goose rodados a partir do container tools.
       GOOSE_DRIVER: postgres
       GOOSE_DBSTRING: *db-owner-url

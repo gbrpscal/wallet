@@ -43,7 +43,8 @@ internal/domain/             modelo puro (sem Fx, HTTP, SQS ou banco)
   event/                       envelope e eventos concretos
 internal/app/                casos de uso (Service), portas (UnitOfWork, repositórios),
                              políticas de retry e de espera, cursor, erros de infraestrutura
-internal/testutil/pgtest/     banco temporário para os testes de integração
+internal/bootstrap/          raiz de composição: configuração e módulos Fx (main e testes)
+internal/testutil/pgtest/     banco temporário para os testes de integração e de resiliência
 internal/adapters/
   postgres/                  pool, UnitOfWork, repositórios e classificação de erros
   httpapi/                   servidor, rotas, autenticação OIDC, erros (problem+json), health checks
@@ -55,6 +56,7 @@ internal/platform/
 migrations/                  schema, constraints e triggers (goose)
 deploy/                      papéis do PostgreSQL, realm do Keycloak, filas, Toxiproxy
 scripts/mutation.sh          testes de mutação curados
+test/resilience/             testes com 3 processos reais, SIGKILL e Toxiproxy (tag resilience)
 ```
 
 A dependência é sempre para dentro: `adapters → app → domain`. Dentro do domínio ela segue uma direção única: `wagering → wallet → money → domain`, e `event → wallet`. O teste `TestDomainHasNoInfrastructureImports` falha se o domínio importar Fx, `net/http`, AWS, pgx ou `database/sql`.
@@ -74,7 +76,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 7 | Consumidor SQS | concluída |
 | 8 | Outbox e workers | concluída |
 | 9 | Observabilidade | concluída |
-| 10 | Testes de concorrência, multi-instância e falha | pendente |
+| 10 | Testes de concorrência, multi-instância e falha | concluída |
 | 11 | Documentação final | pendente |
 | 12 | Verificação final | pendente |
 
@@ -376,7 +378,7 @@ Também valem estas regras:
   - (b) é mais tolerante, mas um "sucesso sem efeito" é ambíguo e conta como duas reversões bem-sucedidas.
 - **Escolha e justificativa:** (a). A segunda reversão é `REJECTED` com `ALREADY_REVERSED`, sem movimentação. Um `ROLLBACK` de um `REFUND` continua permitido, porque referencia outra transação. O índice único `wager_transactions_one_reversal_uq` impõe a regra também no banco.
 - **Critério impactado:** Integridade financeira.
-- **Como verificar:** `TestReversalRejections/already_reversed` (domínio) e `TestOneSuccessfulReversalPerReference` (banco). A corrida entre reversões em processos diferentes será testada na Fase 10.
+- **Como verificar:** `TestReversalRejections/already_reversed` (domínio) e `TestOneSuccessfulReversalPerReference` (banco). Entre processos, a regra é garantida pelo índice único no banco; não há um teste multi-instância dedicado a duas reversões simultâneas da mesma aposta (§7).
 - **Limitações:** depois de `BET` → `REFUND` → `ROLLBACK do REFUND`, a `BET` não pode ser devolvida de novo (a regra é uma reversão por referência).
 
 #### D5. Referência existente mas não processada
@@ -473,7 +475,8 @@ Também valem estas regras:
   - `TestConcurrentDebitsDoNotLoseUpdates` (40 apostas paralelas na mesma carteira; saldo, versão e cadeia exatos).
   - `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestSaveDetectsStaleVersion` e `TestLockTimeoutIsTransient`.
   - Os mutantes "lock da carteira sem FOR UPDATE" e "UPDATE sem checar a versão".
-- **Limitações:** uma carteira muito disputada tem o throughput limitado à serialização dos seus escritores. Por enquanto só há testes com um processo; a prova com ≥ 3 processos fica para a Fase 10.
+- **Entre processos:** `TestBurstOnOneWalletAcrossInstances` dispara 60 apostas distintas na mesma carteira pelos 3 processos e exige **zero** conflitos de concorrência: o lock serializa os escritores de processos diferentes, e a checagem de versão nunca precisa agir (§4.19).
+- **Limitações:** uma carteira muito disputada tem o throughput limitado à serialização dos seus escritores.
 
 #### D11. Acesso ao banco: pgx puro com UnitOfWork
 
@@ -634,7 +637,7 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
   - Como nenhuma transação é confirmada em `PENDING`, não há `PENDING` a retomar. Uma queda antes do commit não deixa nada gravado.
 - **Critério impactado:** Integridade financeira e Mensageria e recuperação.
 - **Como verificar:** `TestReplayReturnsOriginalResult` (resultado terminal na primeira resposta) e `TestReversalBeforeReferenceResolvedByWorker`.
-- **Limitações:** o cenário "interromper após confirmar `PENDING` e antes de executar" não se aplica (nenhum `PENDING` é confirmado). O equivalente, a retomada de `PENDING_REFERENCE` por outra instância, é demonstrado na Fase 10.
+- **Limitações:** o cenário "interromper após confirmar `PENDING` e antes de executar" não se aplica (nenhum `PENDING` é confirmado). O equivalente, a retomada de `PENDING_REFERENCE` por outra instância, é demonstrado por `TestRestartAllInstances` e `TestWorkersAcrossInstances` (§4.19).
 
 #### Fluxo de idempotência e corrida entre requisições iguais
 
@@ -1045,7 +1048,7 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
 - **Depois da reserva e antes de publicar:** o lease vence e outro publisher assume (`TestAbandonedClaimIsRecovered`, com o gancho `SetAfterClaim`).
 - **Depois de publicar e antes de marcar:** outro publisher republica com o **mesmo `eventId` e os mesmos bytes**. O registro das chamadas mostra as duas publicações idênticas, e a fila assinante recebe uma única cópia, porque o broker deduplica (`TestRepublishAfterCrashKeepsEventID`, com o gancho `SetAfterPublish`).
 - **Nada é publicado antes do commit:** os eventos de uma transação aberta são invisíveis ao publisher (`TestNothingIsPublishedBeforeCommit`).
-- **Ganchos de teste:** `SetAfterClaim` e `SetAfterPublish` foram escolhidos no lugar de um publicador falso porque só um gancho alcança o intervalo entre publicar e marcar. As quedas reais (SIGKILL, Toxiproxy) entram na Fase 10.
+- **Ganchos de teste:** `SetAfterClaim` e `SetAfterPublish` foram escolhidos no lugar de um publicador falso porque só um gancho alcança o intervalo entre publicar e marcar. As quedas reais (SIGKILL de um publisher com eventos reservados) estão em `TestKillPublisherHoldingClaims` (§4.19).
 
 #### Worker de referências pendentes
 
@@ -1064,7 +1067,7 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
 - **Encerramento:** os loops param de iniciar trabalho novo. O que está em andamento termina dentro de `SHUTDOWN_TIMEOUT`, e o publisher **libera na hora** as reservas que não começou, para outra instância publicar sem esperar o lease (`TestStopReleasesUnstartedClaims`, `TestOutboxLoopLifecycle` e o mutante "encerramento não libera as reservas").
 - **Logs:** sucessos em `debug` (com `eventId`, `eventType` e `aggregateId`) e falhas em `warn`.
 
-### 4.16 Composição com Fx e ciclo de vida (parcial)
+### 4.16 Composição com Fx e ciclo de vida
 
 - **Contexto:** "Fx compõe configuração, conexões, repositórios, casos de uso, handlers e workers […] fechamento das dependências depois dos componentes que as utilizam."
 - **Implementado até aqui:**
@@ -1074,7 +1077,13 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
   - O servidor HTTP abre o listener no `OnStart`, de modo que uma porta ocupada faz a inicialização falhar.
   - No `OnStop`, a readiness passa a falhar e o servidor drena as requisições dentro de `SHUTDOWN_TIMEOUT` (`fx.StopTimeout`).
   - O pool do PostgreSQL é fechado depois do servidor (ordem inversa de inicialização do Fx).
-- **Como verificar:** hoje, de forma manual: `docker compose stop app` mostra no log o hook do servidor executando antes do hook do pool. O teste automatizado da composição Fx será feito na Fase 10.
+- **Raiz de composição:** `internal/bootstrap.Options(cfg)` reúne `fx.Supply(cfg)`, `fx.StopTimeout`, o logger do Fx e os módulos. O `main` só carrega a configuração e chama `fx.New(bootstrap.Options(cfg)).Run()`; o teste usa exatamente a mesma composição. O pacote fica fora de `internal/app` porque os adaptadores importam `app`, e o inverso criaria um ciclo.
+- **Ordem real dos hooks:** o Fx registra os hooks na ordem em que **constrói** os componentes, e essa ordem vem das dependências, não da posição do módulo na lista. Por exemplo, o pool é construído quando o consumidor pede o `Service`, então o hook do pool é sempre registrado antes e parado depois. Por isso o mutante que trocava a ordem dos módulos `postgres` e `sqs` foi removido como equivalente.
+- **Como verificar:**
+  - `TestCompositionLifecycle` (tag `integration`, `fxtest`): sobe a composição real sobre banco, filas e tópico exclusivos e abre uma carteira pela API; o worker publica os 2 eventos. Ao parar, confere que nenhum hook falhou, a ordem (workers, servidor HTTP, consumidor e, por fim, o pool) e a liberação de fato: o pool recusa conexões, a porta HTTP está livre e uma mensagem enviada depois do stop continua na fila.
+  - `TestGracefulTermination` (tag `resilience`): SIGTERM em um processo real sob carga; o processo sai com código 0 dentro do `SHUTDOWN_TIMEOUT`, e as outras instâncias concluem tudo.
+  - Mutantes "pool do banco nunca é fechado", "consumidor sem hook de stop", "servidor HTTP não para no stop" e "publisher da outbox sem hook de stop".
+- **Limitação observada:** um long polling do SQS aberto antes do stop pode, no broker, ainda reservar uma mensagem depois que o cliente desistiu. Ela não se perde: volta a ficar visível quando vence a visibilidade (30 s em produção) e outra instância a processa. O teste espera o long polling (1 s) terminar antes de conferir a fila.
 - **Consumidor SQS:** ligado ao ciclo de vida (`StartConsumer`), para antes do pool do banco e tem encerramento seguro (§4.14).
 - **Workers:** o publisher da outbox e o worker de referências são ligados ao ciclo de vida em `internal/worker` e param antes do pool do banco, liberando as reservas não iniciadas (§4.15). Em `docker compose stop`, a ordem observada é: workers, servidor HTTP, consumidor SQS e, por fim, o pool (o Fx para os componentes na ordem inversa em que foram registrados).
 
@@ -1137,7 +1146,7 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
   - (b) é mais flexível e isolado por teste, mas o socket montado equivale a root no host e a execução fica mais lenta.
 - **Escolha e justificativa:** (a). Cada instância é um processo com suas próprias conexões e memória, o que atende "pelo menos três processos independentes".
 - **Critério impactado:** Testes e Concorrência.
-- **Como verificar:** na Fase 10.
+- **Como verificar:** `test/resilience` (§4.19): o teste compila o binário e sobe 3 processos filhos no próprio container `tools`; o Toxiproxy é controlado pela sua API HTTP; nenhum socket do Docker é montado.
 - **Limitações:** os testes dependem de a stack do Compose estar no ar; o README traz o comando.
 
 #### Testes de mutação curados
@@ -1150,7 +1159,7 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 118 mutantes mortos e 0 problemas: 28 de domínio, 5 de logs e métricas, 20 de persistência, 23 de casos de uso, 16 de HTTP e autenticação, 12 do consumidor SQS e 14 da outbox e dos workers (os cinco últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
+- **Como verificar:** o comando abaixo, que hoje dá 122 mutantes mortos e 0 problemas: 28 de domínio, 5 de logs e métricas, 20 de persistência, 23 de casos de uso, 16 de HTTP e autenticação, 12 do consumidor SQS, 14 da outbox e dos workers e 4 da composição Fx (os seis últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). Com `MUTATION_RESILIENCE=1`, entram mais 4 mutantes contra os cenários de 3 processos (126 no total; alguns minutos a mais). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
@@ -1243,6 +1252,74 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma.
 - **Como verificar:** `TestContextAttributesReachEveryLine`, `TestContextIsNotMutated`, `TestAccessLog`, `TestLogsCarryNoCredentialsOrMoney` (API, inclusive com token inválido e JSON quebrado) e `TestLogsCarryIdsButNoMoney` (casos de uso).
 - **Correção nesta fase:** o worker de referências (Fase 8) registrava `component` duas vezes em cada linha; o logger com o componente era passado ao loop, que o acrescentava de novo. Corrigido, junto com o mesmo padrão no `gauge-refresher`; `TestGaugeLoopReportsBacklogAndDeadLetters` confere uma única ocorrência.
 
+### 4.19 Testes de concorrência, múltiplas instâncias e falha
+
+Todas as escolhas desta seção foram feitas explicitamente, uma a uma. A base é a D15 (§4.17): dependências no Compose e instâncias da aplicação como processos independentes dentro do container `tools`, sem o socket do Docker. Os testes ficam em `test/resilience`, com a tag `resilience` (D13).
+
+#### Como as instâncias sobem
+
+- **Contexto:** "Garantias demonstradas com pelo menos três processos independentes, cada um com suas próprias conexões e memória." / "Cenários relevantes repetidos com ≥ 3 instâncias independentes."
+- **Opções consideradas:** (a) o `TestMain` compila `cmd/wallet` e cada instância é um processo filho (`exec.Command`); (b) um script shell sobe os processos e os testes só fazem chamadas.
+- **Prós e contras:**
+  - (a) dá ao teste controle preciso de SIGKILL, SIGTERM e reinício no momento certo, e acesso aos logs de cada processo.
+  - (b) é mais simples de ler, mas o controle de queda fica fora do teste e é mais frágil.
+- **Escolha e justificativa:** (a), com estes parâmetros:
+  - **3 instâncias** por cenário (o mínimo exigido), cada uma com portas HTTP e de métricas próprias;
+  - binário compilado com **`-race`**: uma condição de corrida em qualquer processo derruba o processo e falha o teste;
+  - banco temporário (`pgtest`), filas e tópico **exclusivos de cada teste**, sem interferir no app do Compose nem entre cenários;
+  - pacote `test/resilience`, fora de `internal/`: o teste é caixa-preta (HTTP, SQS e consultas ao banco);
+  - **tempos encurtados** só por variáveis de ambiente (visibilidade 5 s, long polling 1 s, backoff do consumidor 1–4 s, lease 3 s, worker de referências a cada 200 ms, `SHUTDOWN_TIMEOUT` 5 s); o código é o de produção;
+  - **log por instância** em arquivo; ao fim, cada log é varrido em busca de `panic` e `DATA RACE`, e, se o teste falhou, as últimas linhas de cada instância são impressas;
+  - **métricas por instância**, somadas pelo teste como evidência (duplicatas, reentregas e conflitos entre processos).
+- **Rede:** as instâncias alcançam o PostgreSQL e o LocalStack (SQS e SNS) pelo Toxiproxy; o próprio teste fala direto com eles, para poder enviar mensagens e conferir o banco durante uma queda simulada. O Toxiproxy é controlado pela sua API HTTP com `net/http`, sem dependência nova.
+- **Critério impactado:** Concorrência, Idempotência, Mensageria e recuperação, e Testes.
+- **Como verificar:** `docker compose run --rm tools go test -tags=resilience -v ./test/resilience/` (2 a 3 minutos, incluindo a compilação com `-race`).
+- **Limitações:** as instâncias rodam no mesmo container, então compartilham CPU e rede, mas não memória nem conexões.
+
+#### Cenários
+
+| Teste | Cenário | O que comprova |
+|---|---|---|
+| `TestFiftyIdenticalBetsAcrossInstances` | a mesma aposta 50 vezes em paralelo, espalhada pelos 3 processos | 1 débito, 49 replays (também na soma das métricas) e nenhum conflito de versão |
+| `TestTwoBetsOf80AcrossInstances` | 2 apostas de 80.00 numa carteira de 100.00, em processos diferentes, em 3 rodadas | 1 `PROCESSED`, 1 `REJECTED` (`INSUFFICIENT_FUNDS`), saldo 20.00, 1 débito; reenvios não mudam o resultado |
+| `TestBurstOnOneWalletAcrossInstances` | 60 apostas distintas na mesma carteira, disparadas juntas | todas aplicadas, saldo 40.00 e **zero** conflitos de concorrência: o lock serializa os processos |
+| `TestIndependentWalletsAcrossInstances` | 15 carteiras × 10 apostas, pelos 3 processos | todas as carteiras com o saldo esperado |
+| `TestHTTPAndSQSAcrossInstances` | a mesma operação por HTTP e por SQS (duas mensagens com a mesma chave e uma cópia da primeira) | 1 débito por operação; 3 duplicatas por operação, das quais 1 barrada pela inbox |
+| `TestWorkersAcrossInstances` | 3 publishers na mesma outbox; reversões antes das apostas, resolvidas pelos 3 workers | cada evento entregue uma vez e na ordem de cada carteira; cada reversão concluída uma vez |
+| `TestKillDuringLoad` | SIGKILL em uma instância no meio de uma rajada HTTP + SQS; ela volta 2 s depois | 1 débito por operação, nenhuma mensagem perdida, DLQ vazia |
+| `TestRestartAllInstances` | as 3 instâncias caem juntas com operações concluídas, uma rejeição, reversões pendentes e eventos não publicados; sobem 3 novas | replays devolvem o resultado original; pendências retomadas; outbox drenada |
+| `TestKillConsumerAfterCommit` | SIGKILL entre o commit e a remoção da mensagem | a reentrega é barrada pela inbox (métrica `inbox_redelivery` > 0) e a operação continua aplicada uma vez |
+| `TestKillPublisherHoldingClaims` | SIGKILL no único publisher enquanto ele tem eventos reservados | outro publisher assume depois do lease; cada evento chega uma vez, com o mesmo `eventId`, na ordem da carteira |
+| `TestGracefulTermination` | SIGTERM em uma instância sob carga | saída com código 0 dentro do prazo; nada se perde |
+| `TestDatabaseOutage` | PostgreSQL inalcançável por 5 s no meio da carga | `503 UNAVAILABLE` sem efeito parcial; readiness falha e volta; mensagens voltam à fila sem ir para a DLQ; tudo aplicado uma vez |
+| `TestBrokerOutage` | SQS e SNS inalcançáveis por 6 s | a API continua operando; readiness falha; eventos esperam na outbox com tentativas registradas; fila e outbox drenadas ao voltar |
+
+Todos os cenários terminam com a mesma verificação: o saldo de cada carteira bate com o ledger, nenhuma transação tem mais de um lançamento, a outbox está toda publicada e cada evento chegou exatamente uma vez à fila assinante.
+
+#### Momento da queda: carga e evidência
+
+- **Contexto:** quedas "após o commit e antes da remoção" e "com eventos reservados" precisam acontecer de fato, não só em teoria.
+- **Opções consideradas:** (a) matar sob carga, sem código de teste no binário, e exigir evidência de que a janela foi atingida; (b) ganchos por variável de ambiente que pausam o binário no ponto exato; (c) matar sob carga sem exigir evidência.
+- **Escolha e justificativa:** (a). O ponto exato já é coberto de forma determinística pelos ganchos dos testes de integração (Fases 7 e 8). Aqui, cada cenário de queda **recusa o próprio resultado** se não houver evidência:
+  - a queda durante a carga precisa acontecer antes de 3/4 da carga (nas execuções observadas, entre 97 e 112 de 400 débitos);
+  - a queda do publisher precisa deixar eventos reservados e ainda com lease (nas execuções observadas, entre 43 e 50);
+  - a reinicialização precisa encontrar eventos não publicados (30);
+  - a queda do consumidor precisa produzir uma reentrega barrada pela inbox.
+- **Janela entre o commit e a remoção:** é estreita demais para ser acertada de forma estável só com carga. Atrasar as requisições ao SQS não alargou a janela, porque o Toxiproxy entrega o `DeleteMessage` já recebido mesmo depois que o processo morre. A solução adotada é uma **latência de 100 ms nas respostas do PostgreSQL**, só nesse teste: o `COMMIT` é aplicado no banco e a confirmação chega atrasada, então um SIGKILL nesse intervalo produz exatamente o caso real. Com isso, a janela é atingida na primeira rodada em todas as execuções observadas.
+- **Limitações:** a evidência é estatística, não o ponto exato. O teste tenta até 6 rodadas antes de falhar.
+
+#### Indisponibilidade com o Toxiproxy
+
+- **Escolha:** PostgreSQL fora (5 s) e SQS/SNS fora (6 s), desligando o proxy, que recusa conexões novas e derruba as abertas. A latência alta no banco como cenário próprio não foi incluída.
+- **Ajuste de tempos:** o backoff do consumidor (1–4 s) faz 5 recebimentos durarem mais que a queda de 5 s, então nenhuma mensagem vai para a DLQ só por causa da queda. O mutante "queda do banco manda mensagens para a DLQ" prova que o teste percebe o contrário.
+
+#### Mutantes contra os processos reais
+
+- **Escolha:** um grupo rápido da composição Fx (4 mutantes, sempre) e 4 mutantes de resiliência, cada um rodando só o cenário que o detecta, ativados por `MUTATION_RESILIENCE=1`, porque cada um recompila o binário e leva alguns minutos.
+- **O que eles mostraram:**
+  - "lock da carteira sem FOR UPDATE" sobrevivia aos cenários de apostas: duas requisições raramente se sobrepõem no tempo, e a checagem de versão, segunda defesa da D1, mantinha o resultado correto. Isso levou ao `TestBurstOnOneWalletAcrossInstances`, que exige zero conflitos. Sem o lock, a colisão aparece como conflito de **unicidade na cadeia do ledger** (a mesma versão gravada duas vezes) antes de chegar à checagem de versão da carteira; por isso o cenário exige zero conflitos de qualquer tipo.
+  - "queda do banco manda mensagens para a DLQ" só morria por timeout; a espera passou a falhar assim que aparece mensagem na DLQ.
+
 ---
 
 ## 5. Evidências por critério de avaliação
@@ -1250,11 +1327,11 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma.
 | Critério | Pontos | Evidência atual | Pendente |
 |---|---|---|---|
 | Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8). No banco: saldo ≥ 0, ledger append-only (privilégio + trigger), cadeia do ledger e conferência saldo × ledger no commit, máquina de estados e regras dos tipos (§4.11); reconciliação em snapshot único que detecta divergência sem alterar o saldo (`TestReconciliation`, §4.12) | — |
-| Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11); `TestFiftyIdenticalBetsInParallel`, `TestTwoBetsOf80OnWalletWith100`, `TestIndependentWalletsInParallel` (§4.12) | testes com ≥ 3 processos |
-| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12); HTTP × SQS nas duas ordens e reentregas deduplicadas pela inbox (§4.14) | reinício de todos os processos |
-| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12); consumidor com inbox na mesma transação, DLQ imediata para erros permanentes, backoff e redrive, queda entre commit e remoção, heartbeat e encerramento seguro (§4.14); publisher da outbox com reserva por lease, ordem por agregado, backoff sem desistir, recuperação de trabalho abandonado, republicação com o mesmo eventId e DLQ da assinatura; worker de referências paralelo por carteira (§4.15) | quedas reais (Fase 10) |
-| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.16); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
-| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real, consumidor e publisher com LocalStack real) com PostgreSQL real, todos com `-race`; 118/118 mutantes mortos: 28 de domínio, 5 de logs e métricas, 20 de SQL e repositórios, 23 de casos de uso, 16 de HTTP e autenticação, 12 do consumidor, 14 da outbox e dos workers (§4.17) | paralelismo multiprocesso, falhas com Toxiproxy |
+| Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11); `TestFiftyIdenticalBetsInParallel`, `TestTwoBetsOf80OnWalletWith100`, `TestIndependentWalletsInParallel` (§4.12); com 3 processos independentes: 50 apostas iguais, 2 × 80.00, rajada na mesma carteira sem nenhum conflito e carteiras independentes (§4.19) | — |
+| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12); HTTP × SQS nas duas ordens e reentregas deduplicadas pela inbox (§4.14); HTTP × SQS entre 3 processos e replays com o resultado original depois do reinício de todos os processos (§4.19) | — |
+| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12); consumidor com inbox na mesma transação, DLQ imediata para erros permanentes, backoff e redrive, queda entre commit e remoção, heartbeat e encerramento seguro (§4.14); publisher da outbox com reserva por lease, ordem por agregado, backoff sem desistir, recuperação de trabalho abandonado, republicação com o mesmo eventId e DLQ da assinatura; worker de referências paralelo por carteira (§4.15); SIGKILL sob carga, entre o commit e a remoção, com eventos reservados e de todas as instâncias; PostgreSQL e SQS/SNS fora do ar com o Toxiproxy (§4.19) | — |
+| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx com raiz de composição testada (`TestCompositionLifecycle`, §4.16); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
+| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real, consumidor e publisher com LocalStack real) com PostgreSQL real, todos com `-race`; 122/122 mutantes mortos: 28 de domínio, 5 de logs e métricas, 20 de SQL e repositórios, 23 de casos de uso, 16 de HTTP e autenticação, 12 do consumidor, 14 da outbox e dos workers, 4 da composição Fx, mais 4 opcionais contra os 3 processos (§4.17); 13 cenários com 3 processos reais compilados com `-race`, SIGKILL, SIGTERM e Toxiproxy (§4.19) | — |
 | Observabilidade | 5 | logs JSON com ids pelo contexto e access log, sem credenciais nem valores; métricas Prometheus de operações, latência, duplicatas, retries, DLQ, conflitos, atraso e backlog da outbox, reconciliação e pendências, em porta interna; `/health/live`; `/health/ready` com PostgreSQL e SQS (§4.18) | — |
 | Documentação | 5 | este documento e o README | revisão final |
 
@@ -1265,14 +1342,14 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma.
 | Garantia | Estado | Evidência |
 |---|---|---|
 | Dinheiro nunca passa por `float32`/`float64` | ✅ | `TestNoFloatingPointInProductionCode`; parsing estrito; JSON numérico rejeitado |
-| Idempotência persistente, sobrevive ao reinício | parcial | chave, hash e resultado persistidos com unicidade no banco; replay lido do banco (§4.11, §4.12). Reinício de todos os processos na Fase 10 |
+| Idempotência persistente, sobrevive ao reinício | ✅ | chave, hash e resultado persistidos com unicidade no banco; replay lido do banco (§4.11, §4.12); `TestRestartAllInstances`: depois de derrubar os 3 processos, replays em processos novos devolvem o resultado original (§4.19) |
 | Invariantes financeiras garantidas no banco | ✅ | §4.11: CHECKs, triggers de cadeia, de versão e de estado, conferência diferida saldo × ledger; `TestBalanceChangeRequiresLedgerEntry`, `TestDatabaseEnforcesDomainRules` |
 | Eventos externos publicados só após o commit | ✅ | outbox gravada no mesmo commit (`TestUnitOfWorkRollsBackEverything`); o publisher não enxerga transações abertas (`TestNothingIsPublishedBeforeCommit`) |
 | Ledger append-only; correções por novos lançamentos | ✅ | privilégio só `SELECT`/`INSERT` para a aplicação e triggers contra `UPDATE`/`DELETE`/`TRUNCATE`; `TestLedgerIsAppendOnly` |
-| Carteiras independentes em paralelo; nenhum lock global | ✅ (um processo) | lock só na linha da carteira; `TestIndependentWalletsDoNotBlock`. Multiprocesso na Fase 10 |
-| Sem lost updates no saldo | ✅ (um processo) | `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`. Multiprocesso na Fase 10 |
+| Carteiras independentes em paralelo; nenhum lock global | ✅ | lock só na linha da carteira; `TestIndependentWalletsDoNotBlock`; `TestIndependentWalletsAcrossInstances` (3 processos) |
+| Sem lost updates no saldo | ✅ | `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`; com 3 processos, `TestBurstOnOneWalletAcrossInstances` e `TestTwoBetsOf80AcrossInstances` |
 | Unicidade, não negatividade e imutabilidade impostas pelo banco | ✅ | índices únicos, `CHECK (balance_minor >= 0)` e triggers (§4.11) |
-| Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | parcial | Em um processo: recebimento repetido por HTTP e SQS (`TestHTTPAndSQSShareIdempotency`, `TestRedeliveredMessageIsNotReprocessed`); reversão antes da referência; processamento simultâneo na mesma carteira; queda entre commit e remoção da mensagem (`TestCrashAfterCommitBeforeDelete`); indisponibilidade temporária (retry e backoff). Publicação repetida de evento (`TestRepublishAfterCrashKeepsEventID`, `TestTwoPublishersCompete`). Pendentes: a repetição com ≥ 3 processos, quedas abruptas e Toxiproxy (Fase 10) |
+| Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | ✅ | Recebimento repetido por HTTP e SQS: `TestHTTPAndSQSShareIdempotency`, `TestHTTPAndSQSAcrossInstances`. Reversão antes da referência: `TestReversalBeforeReferenceResolvedByWorker`, `TestWorkersAcrossInstances`. Processamento simultâneo na mesma carteira: `TestBurstOnOneWalletAcrossInstances`. Encerramento abrupto antes ou depois de um commit: `TestKillDuringLoad`, `TestKillConsumerAfterCommit`, `TestRestartAllInstances`. Publicação repetida de evento: `TestRepublishAfterCrashKeepsEventID`, `TestKillPublisherHoldingClaims`. Indisponibilidade temporária: `TestDatabaseOutage`, `TestBrokerOutage` (§4.19) |
 
 ---
 
@@ -1284,7 +1361,11 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma.
 - A deduplicação de eventos pelo broker vale por 5 minutos; depois disso, cabe ao consumidor deduplicar pelo `eventId` (§4.15).
 - Todas as decisões D1–D15 estão tomadas.
 - O LocalStack comunitário não aplica as políticas de acesso das filas (§4.14).
-- A concorrência só foi demonstrada com um processo; a prova com ≥ 3 processos independentes fica para a Fase 10.
+- Os testes de resiliência rodam as 3 instâncias no mesmo container: são processos independentes (memória e conexões próprias), mas compartilham CPU e rede (§4.19).
+- A evidência de queda na janela entre o commit e a remoção é estatística; o ponto exato é coberto pelos ganchos dos testes de integração (§4.14, §4.19).
+- Não há teste multi-instância dedicado a duas reversões simultâneas da mesma aposta; a regra é garantida pelo índice único `wager_transactions_one_reversal_uq` (§4.8).
+- A expiração de referência pendente é testada com um processo; com 3 processos, só a resolução é testada. As duas conclusões passam pelo mesmo lock da carteira e pela mesma checagem do agendamento (§4.12, §4.19).
+- Depois de um stop, um long polling já aberto pode reservar uma mensagem no broker; ela volta após a visibilidade e é processada por outra instância (§4.16).
 - O banco não confere que a transação está `PROCESSED` quando o seu lançamento é gravado (§4.11).
 - Moedas limitadas a BRL, USD e EUR, todas com 2 casas decimais.
 - LocalStack fixado na linha comunitária `4.14.0`, que não recebe novas correções.

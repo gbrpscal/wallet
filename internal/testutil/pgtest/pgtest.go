@@ -1,6 +1,6 @@
-//go:build integration
+//go:build integration || resilience
 
-// Package pgtest cria, para testes de integração, um banco PostgreSQL
+// Package pgtest cria, para testes de integração e de resiliência, um banco PostgreSQL
 // temporário com as migrations aplicadas e os papéis reais (wallet_owner e
 // wallet_app).
 package pgtest

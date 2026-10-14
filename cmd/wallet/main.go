@@ -7,14 +7,8 @@ import (
 
 	"go.uber.org/fx"
 
-	"github.com/gbrpscal/wallet/internal/adapters/httpapi"
-	"github.com/gbrpscal/wallet/internal/adapters/postgres"
-	"github.com/gbrpscal/wallet/internal/adapters/sqs"
-	"github.com/gbrpscal/wallet/internal/app"
+	"github.com/gbrpscal/wallet/internal/bootstrap"
 	"github.com/gbrpscal/wallet/internal/platform/config"
-	"github.com/gbrpscal/wallet/internal/platform/logging"
-	"github.com/gbrpscal/wallet/internal/platform/metrics"
-	"github.com/gbrpscal/wallet/internal/worker"
 )
 
 func main() {
@@ -23,17 +17,5 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-
-	fx.New(
-		fx.Supply(cfg),
-		fx.StopTimeout(cfg.ShutdownTimeout),
-		fx.WithLogger(logging.FxLogger),
-		logging.Module,
-		metrics.Module,
-		postgres.Module,
-		sqs.Module,
-		app.Module,
-		httpapi.Module,
-		worker.Module,
-	).Run()
+	fx.New(bootstrap.Options(cfg)).Run()
 }

@@ -433,7 +433,7 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestWalletVersionRules`, `TestBalanceCannotBeNegative` | versão +1 só com mudança de saldo; saldo ≥ 0 |
 | `TestDatabaseEnforcesDomainRules`, `TestTransactionStateMachineInDatabase` | regras dos tipos, códigos de falha e máquina de estados no banco |
 | `TestIdempotencyConstraints`, `TestOneSuccessfulReversalPerReference` | unicidade por provedor, operação com outra chave, uma reversão por referência |
-| `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100` | nenhuma atualização perdida sob concorrência (um processo; vários processos ficam para a Fase 10) |
+| `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100` | nenhuma atualização perdida sob concorrência (com vários processos, veja a seção de resiliência) |
 | `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` | lock só por carteira; espera excessiva vira erro transitório |
 | `TestUnitOfWorkRollsBackEverything` | atomicidade: nada é gravado se a transação falha |
 | `TestOutboxSnapshotIsImmutable`, `TestInboxDeduplicates` | snapshot imutável da outbox; deduplicação da inbox |
@@ -490,6 +490,12 @@ Os testes `TestSaveDetectsStaleVersion`, `TestLockTimeoutIsTransient` e `TestIde
 | `TestOrderWithinWallet`, `TestHeartbeatKeepsMessageInvisible` | ordem por carteira; processamento longo não deixa a mensagem reaparecer |
 | `TestGracefulShutdown`, `TestStopDeadlineCancelsInFlight` | SIGTERM conclui a mensagem em andamento e devolve as não iniciadas; prazo estourado cancela sem gravar nada |
 
+**Composição Fx** (`internal/bootstrap`)
+
+| Teste | O que comprova |
+|---|---|
+| `TestCompositionLifecycle` | a composição real do `main` sobe, atende uma abertura e publica os eventos; ao parar, nenhum hook falha, a ordem é workers → servidor HTTP → consumidor → pool, o pool recusa conexões, a porta HTTP fica livre e o consumidor não recebe mais nada |
+
 **Outbox e workers** (`internal/worker`, com SNS e SQS reais; cada teste cria o seu banco e o seu tópico)
 
 | Teste | O que comprova |
@@ -519,22 +525,70 @@ docker compose run --rm tools bash scripts/mutation.sh
 
 Cada linha mostra o defeito e os testes que o detectaram (`KILLED`). `SURVIVED` indica regra sem teste, e `INVALID` indica mutante que não compila. Antes de cada grupo, os testes rodam sem mutação; se essa linha de base falhar (por exemplo, com o banco fora do ar), o script aborta em vez de contar falhas de ambiente como mutantes mortos. O script termina com erro se houver qualquer resultado diferente de `KILLED`. Para rodar só um grupo, filtre pelo nome do mutante, por exemplo: `docker compose run --rm -e MUTATION_FILTER="inbox|DLQ" tools bash scripts/mutation.sh`.
 
+O grupo de resiliência roda 4 mutantes contra os 3 processos reais, cada um só com o cenário que o detecta. Ele é opcional porque leva alguns minutos e exige a stack inteira no ar:
+
+```bash
+docker compose run --rm -e MUTATION_RESILIENCE=1 tools bash scripts/mutation.sh
+```
+
 ## Testes de integração, múltiplas instâncias e falha
 
-*Parcial.* Os testes de persistência estão descritos acima; os demais virão nas Fases 5 a 10. Os testes são separados por build tags:
+Os testes são separados por build tags:
 
-| Tag | Conteúdo |
+| Tag | Conteúdo | Pré-requisito |
+|---|---|---|
+| *(nenhuma)* | unitários | nada |
+| `integration` | PostgreSQL, Keycloak e LocalStack reais (descritos acima) | `docker compose up -d --wait postgres keycloak localstack` |
+| `resilience` | 3 processos reais da aplicação, quedas com SIGKILL e SIGTERM, indisponibilidade com o Toxiproxy | a stack inteira: `docker compose up -d --wait` |
+
+As dependências rodam no Compose. As instâncias da aplicação são **processos independentes dentro do container `tools`**, cada um com suas conexões e memória, sem montar o socket do Docker. O teste compila o binário (com `-race`) e sobe 3 cópias, cada uma com as suas portas. Cada teste usa um banco temporário e filas e tópico próprios, então não interfere no app do Compose nem nos outros testes. As instâncias falam com o PostgreSQL e o LocalStack pelo Toxiproxy, que o teste liga e desliga pela API HTTP (`TOXIPROXY_URL`, já definida no container `tools`).
+
+Preparação:
+
+```bash
+docker compose up --build -d --wait
+```
+
+Execução (2 a 3 minutos, incluindo a compilação com `-race`):
+
+```bash
+docker compose run --rm tools go test -tags=resilience -v ./test/resilience/
+```
+
+Para rodar um cenário só, use `-run`, por exemplo `-run TestKillDuringLoad`. Se um teste falhar, as últimas linhas do log de cada instância são impressas. Os logs também são varridos em busca de `panic` e `DATA RACE`.
+
+| Teste | Cenário com 3 processos |
 |---|---|
-| *(nenhuma)* | unitários, sem infraestrutura |
-| `integration` | PostgreSQL, Keycloak e LocalStack reais |
-| `resilience` | ≥ 3 instâncias independentes, interrupções e indisponibilidade (via Toxiproxy) |
+| `TestFiftyIdenticalBetsAcrossInstances` | a mesma aposta 50 vezes, espalhada pelas instâncias: um único débito |
+| `TestTwoBetsOf80AcrossInstances` | duas apostas de 80.00 numa carteira de 100.00 em processos diferentes: uma processada, uma rejeitada, saldo 20.00; reenvios não mudam nada |
+| `TestBurstOnOneWalletAcrossInstances` | 60 apostas distintas na mesma carteira ao mesmo tempo: todas aplicadas, sem nenhum conflito (o lock serializa os processos) |
+| `TestIndependentWalletsAcrossInstances` | muitas carteiras em paralelo pelos 3 processos |
+| `TestHTTPAndSQSAcrossInstances` | a mesma operação por HTTP e por SQS, com mensagens repetidas: um único débito |
+| `TestWorkersAcrossInstances` | 3 publishers na mesma outbox e 3 workers nas mesmas pendências: cada evento e cada reversão uma única vez |
+| `TestKillDuringLoad` | SIGKILL numa instância no meio da carga; ela volta depois |
+| `TestRestartAllInstances` | as 3 caem juntas; 3 novas devolvem os mesmos replays, retomam pendências e publicam os eventos pendentes |
+| `TestKillConsumerAfterCommit` | SIGKILL entre o commit e a remoção da mensagem: a reentrega é barrada pela inbox |
+| `TestKillPublisherHoldingClaims` | SIGKILL no publisher com eventos reservados: outro assume após o lease, sem duplicar |
+| `TestGracefulTermination` | SIGTERM sob carga: saída com código 0, nada se perde |
+| `TestDatabaseOutage` | PostgreSQL fora por 5 s: `503`, readiness falhando e recuperação sem duplicidade nem DLQ |
+| `TestBrokerOutage` | SQS e SNS fora por 6 s: a API continua, os eventos esperam na outbox e são publicados na volta |
 
-As dependências rodam no Compose, e as instâncias da aplicação são processos independentes dentro do container `tools`, sem montar o socket do Docker. A preparação e os comandos completos serão documentados aqui.
+Todo cenário termina conferindo que o saldo de cada carteira bate com o ledger, que nenhuma transação tem dois lançamentos e que cada evento da outbox chegou exatamente uma vez à fila assinante. Nas instâncias de teste, os tempos (visibilidade, lease, backoff) são encurtados por variáveis de ambiente, para os cenários rodarem em segundos; o código é o mesmo da produção. Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md) (§4.19).
+
+### Limitações conhecidas dos testes de resiliência
+
+- **Duas reversões simultâneas da mesma aposta em processos diferentes** não têm um teste multi-instância dedicado. A regra (no máximo uma reversão bem-sucedida por aposta) é garantida pelo índice único `wager_transactions_one_reversal_uq` no banco e testada com um processo (`TestOneSuccessfulReversalPerReference`, `TestRefundAndRollbackOfTheSameBet`).
+- **A expiração de referência pendente** (`REFERENCE_NOT_FOUND`) é testada com um processo (`TestPendingReferenceExpiresAfterMaxAttempts`, `TestPendingReferenceExpiresAfterTTL`, `TestReferenceWorkerExpiresMissingReferences`). Com 3 processos, só a resolução das pendências é testada. A conclusão única entre várias instâncias usa o mesmo lock e a mesma checagem de agendamento nos dois casos.
+- As 3 instâncias rodam no mesmo container: são processos independentes, com memória e conexões próprias, mas compartilham CPU e rede.
+- A queda entre o commit e a remoção da mensagem é provocada sob carga, e o teste exige evidência de que a janela foi atingida. O ponto exato é coberto de forma determinística pelos testes de integração do consumidor.
+
+As demais limitações do projeto estão em [ARCHITECTURE.md](ARCHITECTURE.md) (§7).
 
 ## Estrutura do repositório
 
 ```
-cmd/wallet/            ponto de entrada (composição Fx)
+cmd/wallet/            ponto de entrada: carrega a configuração e sobe a composição
+internal/bootstrap/    raiz de composição Fx (usada pelo main e pelos testes)
 internal/domain/       modelo de domínio puro
 internal/app/          casos de uso, portas (UnitOfWork, repositórios) e erros
 internal/adapters/     PostgreSQL, HTTP, SQS
@@ -542,6 +596,7 @@ internal/platform/     configuração, logs (com atributos de contexto), health,
 deploy/                PostgreSQL (papéis), Keycloak, LocalStack, Toxiproxy
 migrations/            schema, constraints e triggers (goose)
 scripts/               testes de mutação
+test/resilience/       testes com 3 processos reais, SIGKILL e Toxiproxy
 compose.yaml           stack local e container de toolchain
 Dockerfile             imagens tools, build e runtime
 ```
