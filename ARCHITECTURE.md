@@ -24,8 +24,8 @@ Serviço em Go que movimenta carteiras de jogadores por uma API HTTP e por um co
 |---|---|
 | API HTTP (`net/http`) | Abertura e consulta de carteiras, envio e consulta de operações, reconciliação e health checks. |
 | Consumidor SQS | Lê `wager-transactions.fifo` e usa o mesmo caso de uso da API, com inbox na mesma transação SQL. |
-| Worker de referências | Retoma operações em `PENDING_REFERENCE` com backoff. *(pendente)* |
-| Publisher da outbox | Publica os eventos confirmados no banco. *(pendente)* |
+| Worker de referências | Retoma operações em `PENDING_REFERENCE` com backoff, em paralelo por carteira. |
+| Publisher da outbox | Publica, depois do commit, os eventos da outbox no tópico SNS FIFO, com reserva por lease e ordem por agregado. |
 | PostgreSQL | Fonte da verdade: saldo, ledger, transações, inbox e outbox. |
 | Keycloak | IdP OAuth 2.0/OIDC (`client_credentials`). |
 | LocalStack | Emulador de SQS FIFO no ambiente local e nos testes. |
@@ -70,7 +70,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 5 | Casos de uso | concluída |
 | 6 | HTTP e autenticação | concluída |
 | 7 | Consumidor SQS | concluída |
-| 8 | Outbox e workers | pendente |
+| 8 | Outbox e workers | concluída |
 | 9 | Observabilidade | pendente |
 | 10 | Testes de concorrência, multi-instância e falha | pendente |
 | 11 | Documentação final | pendente |
@@ -968,11 +968,99 @@ Se o processo cair depois do commit e antes de remover a mensagem, ela reaparece
 - `SQS_CONSUMER_ENABLED=false` desliga o consumidor, por exemplo para uma instância que só atende HTTP.
 - **A DLQ também é FIFO.** Quem a consome precisa remover cada mensagem lida, porque, enquanto houver mensagens de um grupo em voo, as seguintes do mesmo grupo não são entregues. Isso foi descoberto pelo próprio teste da DLQ.
 
-### 4.15 Decisões pendentes
+### 4.15 Outbox e workers
 
-| # | Decisão | Fase |
-|---|---|---|
-| D10 | Destino dos eventos e contrato de roteamento | 8 |
+Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os eventos gravados na outbox (no mesmo commit da operação, §4.11) são publicados por um `app.OutboxRelay`, que depende de duas portas: `OutboxRepository` (PostgreSQL) e `EventPublisher` (SNS). Os loops com ciclo de vida ficam em `internal/worker`.
+
+#### D10. Destino: tópico SNS FIFO com fila assinante
+
+- **Contexto:** "Eventos externos publicados somente após o commit da transação que os originou." / "Provisionar o destino dos eventos e documentar contratos de roteamento e consumo."
+- **Opções consideradas:** (a) tópico SNS FIFO com fila assinante; (b) fila SQS FIFO direta; (c) EventBridge.
+- **Prós e contras:**
+  - (a) permite vários consumidores independentes (fan-out), cada um com a sua fila.
+  - (b) é mais simples, mas tem um único consumidor lógico.
+  - (c) tem suporte parcial no LocalStack comunitário e nenhuma garantia FIFO.
+- **Escolha e justificativa:** (a). Recursos provisionados:
+  - tópico `wallet-events.fifo`, sem deduplicação por conteúdo;
+  - fila assinante `wallet-events-audit.fifo`, com **entrega raw**: recebe exatamente o envelope gravado na outbox, byte a byte. A alternativa, o envelope do SNS, obrigaria cada consumidor a desembrulhar a mensagem;
+  - DLQ `wallet-events-audit-dlq.fifo`, ligada pela **redrive policy da assinatura**: se o SNS não conseguir entregar à fila, o evento não se perde;
+  - política na fila: só o tópico envia.
+  
+  Antes de implementar, verifiquei no LocalStack 4.14 três comportamentos: a entrega FIFO para a fila FIFO, a deduplicação por id e o redrive da assinatura.
+- **Contrato de roteamento:**
+
+| Campo | Valor |
+|---|---|
+| `MessageGroupId` | `aggregateId` (transação ou carteira): ordem por agregado no broker |
+| `MessageDeduplicationId` | `eventId`: republicações dentro de 5 minutos são descartadas pelo SNS |
+| Atributo `eventType` (String) | tipo do evento, para filtro por assinatura |
+| Atributo `eventVersion` (Number) | versão do contrato do evento |
+| Corpo | o envelope do §4.10 (`eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId`, `occurredAt`, `version`, `data`) |
+
+  A alternativa de usar o `walletId` como grupo para todos os eventos foi descartada: daria uma ordem mais forte, porém com menos paralelismo, e exigiria extrair o `walletId` de cada payload.
+- **Contrato de consumo:** a entrega é **at-least-once**. Depois da janela de 5 minutos do SNS, o consumidor deve deduplicar pelo `eventId`.
+- **Critério impactado:** Mensageria e recuperação.
+- **Como verificar:** `TestEventsArePublishedAsCommitted` (corpo idêntico ao da outbox, grupo, tipo e versão), `TestSubscriptionDeadLetters`, e os mutantes "grupo do broker diferente do agregado" e "republicação com outro id de deduplicação".
+- **Limitações:** a deduplicação do broker vale só por 5 minutos.
+
+#### Disputa entre publishers: reserva com lease
+
+- **Opções consideradas:** (a) reserva com lease; (b) lock durante a publicação; (c) advisory lock por partição.
+- **Prós e contras:**
+  - (a) não segura transação nem conexão durante a chamada de rede e permite recuperar trabalho abandonado.
+  - (b) mantém a transação aberta durante a chamada ao broker.
+  - (c) exige coordenar partições.
+- **Escolha e justificativa:** (a). A migration 00006 acrescenta `claimed_by`, `claimed_until` e `sequence`.
+  - **Reserva:** um `UPDATE … WHERE event_id IN (SELECT … FOR UPDATE SKIP LOCKED)` reserva até 50 eventos para o publisher, por 30 s, e confirma na hora. A publicação acontece fora da transação.
+  - **Identidade do publisher:** `hostname` mais um sufixo aleatório, legível em diagnóstico e único mesmo com várias cópias no mesmo host. A alternativa, um UUID puro, não indicaria a instância.
+  - **Renovação:** enquanto publica, o publisher renova o lease a cada 10 s, então outro só assume se o dono parar de renovar (ou seja, se morreu). A alternativa sem renovação geraria mais republicações sob lentidão.
+  - **Abandono:** com o lease vencido, outro publisher assume.
+  - **Marcação:** `published_at`, `attempts + 1` e a liberação da reserva, condicionados a `published_at IS NULL`.
+- **Como verificar:**
+  - `TestTwoPublishersCompete` (2 publishers, 40 eventos, exatamente 40 chamadas ao broker);
+  - `TestAbandonedClaimIsRecovered` (queda depois da reserva: ninguém assume antes do lease; depois, outro publica);
+  - `TestLeaseIsRenewedDuringSlowPublish` (publicação de 2,5 s com lease de 1 s: ninguém mais assume);
+  - mutantes "reserva ignora lease de outro publisher" e "lease não é renovado".
+
+#### Ordem por agregado
+
+- **Opções consideradas:** (a) garantir a ordem por agregado; (b) sem garantia, com o consumidor ordenando.
+- **Escolha e justificativa:** (a). A reserva só pega o evento pendente **mais antigo** de cada agregado, e apenas se não houver evento anterior do mesmo agregado ainda não publicado (em andamento, em backoff ou reservado por outro). Uma falha segura os eventos seguintes do mesmo agregado até ela sair.
+- **Critério de ordem:** a coluna `sequence` (identity), e não `occurredAt`. Os eventos de uma carteira são inseridos sob o lock da carteira, então a sequência segue a ordem real dos commits, sem depender do relógio de várias instâncias.
+- **Tamanho da reserva:** um evento por agregado por lote. A alternativa, reservar a cadeia contígua do agregado, daria mais vazão em rajadas, mas com consulta e tratamento de falha parcial mais complexos. Quando há trabalho, o publisher volta na hora, sem esperar a ociosidade.
+- **Concorrência no lote:** agregados diferentes em paralelo, até 8 publicações simultâneas.
+- **Como verificar:** `TestOrderPerAggregate` (o evento da versão 3 falha duas vezes e, mesmo assim, os `WalletBalanceChanged` chegam na ordem 1 a 6) e o mutante "reserva ignora a ordem por agregado".
+
+#### Falha no broker: backoff sem desistir
+
+- **Opções consideradas:** (a) backoff sem limite de tentativas; (b) limite de tentativas com "estacionamento" manual.
+- **Escolha e justificativa:** (a). Perder um evento confirmado é proibido pelo enunciado, e com a ordem por agregado um evento estacionado travaria os seguintes. A espera é de 1 s·2ⁿ com teto de 5 min e jitter de ±20%. `attempts`, `last_error` (até 500 caracteres) e `next_attempt_at` ficam registrados, e a reserva é liberada.
+- **Como verificar:** `TestBrokerUnavailableIsRetriedWithBackoff` (falha registrada, nada é reservado de novo antes do backoff, e depois tudo é entregue) e os mutantes "reserva ignora o backoff", "falha de publicação sem agendar nova tentativa" e "falha de publicação marcada como publicada".
+
+#### Queda entre commit e publicação, e entre publicação e marcação
+
+- **Antes da reserva:** o evento fica pendente e qualquer publisher o pega.
+- **Depois da reserva e antes de publicar:** o lease vence e outro publisher assume (`TestAbandonedClaimIsRecovered`, com o gancho `SetAfterClaim`).
+- **Depois de publicar e antes de marcar:** outro publisher republica com o **mesmo `eventId` e os mesmos bytes**. O registro das chamadas mostra as duas publicações idênticas, e a fila assinante recebe uma única cópia, porque o broker deduplica (`TestRepublishAfterCrashKeepsEventID`, com o gancho `SetAfterPublish`).
+- **Nada é publicado antes do commit:** os eventos de uma transação aberta são invisíveis ao publisher (`TestNothingIsPublishedBeforeCommit`).
+- **Ganchos de teste:** `SetAfterClaim` e `SetAfterPublish` foram escolhidos no lugar de um publicador falso porque só um gancho alcança o intervalo entre publicar e marcar. As quedas reais (SIGKILL, Toxiproxy) entram na Fase 10.
+
+#### Worker de referências pendentes
+
+- **Parâmetros:** a cada 1 s, busca até 50 pendências vencidas.
+- **Paralelismo:** carteiras diferentes em paralelo (até 8 por instância) e as da mesma carteira em sequência. Várias instâncias podem rodar ao mesmo tempo; o lock da carteira e a checagem do agendamento garantem uma única conclusão (§4.12).
+- **Erro numa pendência:** é logado em `warn` e **não conta como tentativa da D4**. Assim, uma queda longa do banco não faz reversões expirarem antes da hora.
+- **Como verificar:** `TestReferenceWorkerResolvesPendingReversals` (dois loops simultâneos, duas carteiras: cada reversão com um único lançamento) e `TestReferenceWorkerExpiresMissingReferences`.
+
+#### Execução, configuração e encerramento
+
+- **Processo:** os workers rodam **no mesmo processo** da API e do consumidor, cada um com uma flag (`OUTBOX_PUBLISHER_ENABLED`, `REFERENCE_WORKER_ENABLED`). Uma imagem só, com papéis separáveis por configuração. As alternativas (subcomando separado ou serviço separado no Compose) duplicariam a composição ou o deploy.
+- **Acordar o publisher:** só polling. Com o lote vazio, espera 500 ms; havendo trabalho, consulta de novo na hora. LISTEN/NOTIFY foi descartado por exigir uma conexão dedicada e outro caminho de falha.
+- **Pool do PostgreSQL:** `DB_MAX_CONNS`, padrão 20, o suficiente para 8 resoluções, 8 publicações, o consumidor e o HTTP. Com 3 instâncias, são 60 conexões, abaixo do limite padrão de 100.
+- **Readiness:** continua só com PostgreSQL e SQS. Com o SNS fora do ar, a API e o consumidor seguem aceitando operações, e os eventos aguardam na outbox.
+- **Retenção:** eventos publicados são mantidos; o trigger e os privilégios já impedem `DELETE`.
+- **Encerramento:** os loops param de iniciar trabalho novo. O que está em andamento termina dentro de `SHUTDOWN_TIMEOUT`, e o publisher **libera na hora** as reservas que não começou, para outra instância publicar sem esperar o lease (`TestStopReleasesUnstartedClaims`, `TestOutboxLoopLifecycle` e o mutante "encerramento não libera as reservas").
+- **Logs:** sucessos em `debug` (com `eventId`, `eventType` e `aggregateId`) e falhas em `warn`.
 
 ### 4.16 Composição com Fx e ciclo de vida (parcial)
 
@@ -986,7 +1074,7 @@ Se o processo cair depois do commit e antes de remover a mensagem, ela reaparece
   - O pool do PostgreSQL é fechado depois do servidor (ordem inversa de inicialização do Fx).
 - **Como verificar:** hoje, de forma manual: `docker compose stop app` mostra no log o hook do servidor executando antes do hook do pool. O teste automatizado da composição Fx será feito na Fase 10.
 - **Consumidor SQS:** ligado ao ciclo de vida (`StartConsumer`), para antes do pool do banco e tem encerramento seguro (§4.14).
-- **Pendente:** publisher da outbox e worker de referências (Fase 8).
+- **Workers:** o publisher da outbox e o worker de referências são ligados ao ciclo de vida em `internal/worker` e param antes do pool do banco, liberando as reservas não iniciadas (§4.15). Em `docker compose stop`, a ordem observada é: workers, servidor HTTP, consumidor SQS e, por fim, o pool (o Fx para os componentes na ordem inversa em que foram registrados).
 
 ### 4.17 Ambiente, ferramentas e testes
 
@@ -1060,11 +1148,11 @@ Se o processo cair depois do commit e antes de remover a mensagem, ela reaparece
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 78 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência, 12 de casos de uso, 11 de HTTP e autenticação e 10 do consumidor SQS (os quatro últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
+- **Como verificar:** o comando abaixo, que hoje dá 87 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência, 12 de casos de uso, 11 de HTTP e autenticação, 10 do consumidor SQS e 9 da outbox e dos workers (os cinco últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
-- **Mutantes equivalentes:** um mutante que não muda nenhum comportamento observável não é mantido no script; o motivo é registrado aqui. "Falha não segura as seguintes do mesmo grupo" foi removido: a ordem por carteira é garantida pelo próprio SQS FIFO (nenhuma mensagem de um grupo é entregue enquanto outra está em voo), e reagendar as mensagens seguintes só reduz a espera delas. O mutante revelou que o comentário do código dava o motivo errado, e o comentário foi corrigido.
+- **Mutantes equivalentes:** um mutante que não muda nenhum comportamento observável não é mantido no script; o motivo é registrado aqui. "Falha não segura as seguintes do mesmo grupo" foi removido: a ordem por carteira é garantida pelo próprio SQS FIFO (nenhuma mensagem de um grupo é entregue enquanto outra está em voo), e reagendar as mensagens seguintes só reduz a espera delas. O mutante revelou que o comentário do código dava o motivo errado, e o comentário foi corrigido. "Marcação ignora o dono da reserva" (outbox) também foi removido: a marcação exige `published_at IS NULL`, então nunca há dupla marcação, com ou sem a checagem do dono; essa checagem só permite registrar no log que o lease foi assumido por outro publisher.
 - **Mutantes sobre comportamento aleatório:** o jitter do backoff faz o resultado de um teste variar entre execuções. Três rodadas seguidas mostraram que o mutante "backoff sem teto" às vezes sobrevivia: sem o teto, a espera seria 64s ±20%, quase toda sobreposta à faixa correta de 60s ±20%, e uma única amostra não bastava. `TestReferencePolicyCapsDelay` passou a amostrar 500 vezes e exigir que nenhuma espera passe de 72s; o mutante é morto de forma estável. Por isso, mudanças em código com aleatoriedade devem rodar o script mais de uma vez.
 - **Limitações:** só cobre os defeitos listados; não substitui revisão.
 
@@ -1083,9 +1171,9 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8). No banco: saldo ≥ 0, ledger append-only (privilégio + trigger), cadeia do ledger e conferência saldo × ledger no commit, máquina de estados e regras dos tipos (§4.11); reconciliação em snapshot único que detecta divergência sem alterar o saldo (`TestReconciliation`, §4.12) | — |
 | Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11); `TestFiftyIdenticalBetsInParallel`, `TestTwoBetsOf80OnWalletWith100`, `TestIndependentWalletsInParallel` (§4.12) | testes com ≥ 3 processos |
 | Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12); HTTP × SQS nas duas ordens e reentregas deduplicadas pela inbox (§4.14) | reinício de todos os processos |
-| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12); consumidor com inbox na mesma transação, DLQ imediata para erros permanentes, backoff e redrive, queda entre commit e remoção, heartbeat e encerramento seguro (§4.14) | publisher da outbox, loop do worker |
+| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12); consumidor com inbox na mesma transação, DLQ imediata para erros permanentes, backoff e redrive, queda entre commit e remoção, heartbeat e encerramento seguro (§4.14); publisher da outbox com reserva por lease, ordem por agregado, backoff sem desistir, recuperação de trabalho abandonado, republicação com o mesmo eventId e DLQ da assinatura; worker de referências paralelo por carteira (§4.15) | quedas reais (Fase 10) |
 | Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.16); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
-| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real e consumidor com LocalStack real) com PostgreSQL real, todos com `-race`; 78/78 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso, 11 de HTTP e autenticação, 10 do consumidor (§4.17) | paralelismo multiprocesso, falhas com Toxiproxy |
+| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real, consumidor e publisher com LocalStack real) com PostgreSQL real, todos com `-race`; 87/87 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso, 11 de HTTP e autenticação, 10 do consumidor, 9 da outbox e dos workers (§4.17) | paralelismo multiprocesso, falhas com Toxiproxy |
 | Observabilidade | 5 | logs JSON; `/health/live`; `/health/ready` com PostgreSQL e SQS | IDs nos logs; métricas |
 | Documentação | 5 | este documento e o README | revisão final |
 
@@ -1098,19 +1186,20 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Dinheiro nunca passa por `float32`/`float64` | ✅ | `TestNoFloatingPointInProductionCode`; parsing estrito; JSON numérico rejeitado |
 | Idempotência persistente, sobrevive ao reinício | parcial | chave, hash e resultado persistidos com unicidade no banco; replay lido do banco (§4.11, §4.12). Reinício de todos os processos na Fase 10 |
 | Invariantes financeiras garantidas no banco | ✅ | §4.11: CHECKs, triggers de cadeia, de versão e de estado, conferência diferida saldo × ledger; `TestBalanceChangeRequiresLedgerEntry`, `TestDatabaseEnforcesDomainRules` |
-| Eventos externos publicados só após o commit | pendente | Fase 8 (a outbox já é gravada no mesmo commit: `TestUnitOfWorkRollsBackEverything`) |
+| Eventos externos publicados só após o commit | ✅ | outbox gravada no mesmo commit (`TestUnitOfWorkRollsBackEverything`); o publisher não enxerga transações abertas (`TestNothingIsPublishedBeforeCommit`) |
 | Ledger append-only; correções por novos lançamentos | ✅ | privilégio só `SELECT`/`INSERT` para a aplicação e triggers contra `UPDATE`/`DELETE`/`TRUNCATE`; `TestLedgerIsAppendOnly` |
 | Carteiras independentes em paralelo; nenhum lock global | ✅ (um processo) | lock só na linha da carteira; `TestIndependentWalletsDoNotBlock`. Multiprocesso na Fase 10 |
 | Sem lost updates no saldo | ✅ (um processo) | `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`. Multiprocesso na Fase 10 |
 | Unicidade, não negatividade e imutabilidade impostas pelo banco | ✅ | índices únicos, `CHECK (balance_minor >= 0)` e triggers (§4.11) |
-| Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | parcial | Em um processo: recebimento repetido por HTTP e SQS (`TestHTTPAndSQSShareIdempotency`, `TestRedeliveredMessageIsNotReprocessed`); reversão antes da referência; processamento simultâneo na mesma carteira; queda entre commit e remoção da mensagem (`TestCrashAfterCommitBeforeDelete`); indisponibilidade temporária (retry e backoff). Pendentes: publicação repetida de eventos (Fase 8) e a repetição com ≥ 3 processos, quedas abruptas e Toxiproxy (Fase 10) |
+| Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | parcial | Em um processo: recebimento repetido por HTTP e SQS (`TestHTTPAndSQSShareIdempotency`, `TestRedeliveredMessageIsNotReprocessed`); reversão antes da referência; processamento simultâneo na mesma carteira; queda entre commit e remoção da mensagem (`TestCrashAfterCommitBeforeDelete`); indisponibilidade temporária (retry e backoff). Publicação repetida de evento (`TestRepublishAfterCrashKeepsEventID`, `TestTwoPublishersCompete`). Pendentes: a repetição com ≥ 3 processos, quedas abruptas e Toxiproxy (Fase 10) |
 
 ---
 
 ## 7. Limitações e trabalho não concluído
 
-- Publisher da outbox, loop do worker de referências e métricas ainda não foram implementados (ver §2).
-- A decisão D10 está pendente (§4.15).
+- Métricas ainda não foram implementadas (Fase 9).
+- A deduplicação de eventos pelo broker vale por 5 minutos; depois disso, cabe ao consumidor deduplicar pelo `eventId` (§4.15).
+- Todas as decisões D1–D15 estão tomadas.
 - O LocalStack comunitário não aplica as políticas de acesso das filas (§4.14).
 - A concorrência só foi demonstrada com um processo; a prova com ≥ 3 processos independentes fica para a Fase 10.
 - O banco não confere que a transação está `PROCESSED` quando o seu lançamento é gravado (§4.11).

@@ -107,6 +107,16 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 | `SQS_WAIT_TIME` | `20s` | Long polling (máximo 20s) |
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | Visibilidade de cada recebimento, renovada durante o processamento |
 | `SQS_RETRY_BACKOFF_BASE` / `SQS_RETRY_BACKOFF_MAX` | `2s` / `60s` | Backoff de falhas temporárias |
+| `DB_MAX_CONNS` | `20` | Conexões do pool do PostgreSQL por instância |
+| `SNS_EVENTS_TOPIC_ARN` | *(obrigatória com o publisher ligado)* | Tópico dos eventos de saída |
+| `OUTBOX_PUBLISHER_ENABLED` | `true` | Liga o publisher da outbox |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_LEASE` | `50` / `30s` | Eventos reservados por vez e duração da reserva (renovada a cada terço) |
+| `OUTBOX_IDLE_INTERVAL` | `500ms` | Espera quando não há eventos pendentes |
+| `OUTBOX_PUBLISH_CONCURRENCY` | `8` | Publicações simultâneas (agregados diferentes) |
+| `OUTBOX_RETRY_BASE` / `OUTBOX_RETRY_MAX` | `1s` / `5m` | Backoff de falhas de publicação, sem limite de tentativas |
+| `REFERENCE_WORKER_ENABLED` | `true` | Liga o worker de referências pendentes |
+| `REFERENCE_WORKER_INTERVAL` / `REFERENCE_WORKER_BATCH` | `1s` / `50` | Ciclo e lote do worker |
+| `REFERENCE_WORKER_CONCURRENCY` | `8` | Carteiras resolvidas em paralelo |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
 | `SHUTDOWN_TIMEOUT` | `30s` | Prazo para concluir o trabalho em andamento no encerramento |
 | `READINESS_TIMEOUT` | `2s` | Timeout de cada checagem de readiness |
@@ -184,7 +194,26 @@ docker compose exec localstack awslocal sqs receive-message --max-number-of-mess
   --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo
 ```
 
-*Pendente (Fase 8):* destino dos eventos de saída.
+### Eventos de saída
+
+Depois do commit de cada operação, o publisher da outbox envia os eventos ao tópico SNS FIFO `wallet-events.fifo`. A fila `wallet-events-audit.fifo` assina o tópico e recebe o envelope exatamente como gravado (entrega raw); entregas que falham vão para `wallet-events-audit-dlq.fifo`.
+
+| Evento | Quando |
+|---|---|
+| `WagerTransactionProcessed` | operação concluída (inclusive `LOSS` e a abertura com saldo) |
+| `WagerTransactionRejected` | rejeição definitiva por regra de negócio |
+| `WalletBalanceChanged` | toda alteração efetiva de saldo |
+| `WagerTransactionPendingReference` | operação passou a esperar a referência |
+
+- **Roteamento:** `MessageGroupId` é o `aggregateId` (ordem por agregado), `MessageDeduplicationId` é o `eventId`, e os atributos `eventType` e `eventVersion` permitem filtrar por tipo.
+- **Entrega:** at-least-once. Uma republicação usa sempre o mesmo `eventId`; depois da janela de 5 minutos de deduplicação do SNS, deduplique pelo `eventId`.
+
+Para ver os eventos publicados:
+
+```bash
+docker compose exec localstack awslocal sqs receive-message --max-number-of-messages 10 --message-attribute-names All \
+  --queue-url http://localhost:4566/000000000000/wallet-events-audit.fifo
+```
 
 ## Banco de dados e migrations
 
@@ -322,7 +351,7 @@ docker compose run --rm tools go test -race ./...
 | `internal/app` | política de espera (backoff, teto, expiração), retry de falhas transitórias, cursor do ledger |
 | `internal/adapters/httpapi` | header `Authorization`, JSON estrito, Money só como string, mapeamento de erros para HTTP, recuperação de panic |
 
-### Testes de integração (persistência, casos de uso, API e SQS)
+### Testes de integração (persistência, casos de uso, API, SQS e workers)
 
 Os testes com a tag `integration` usam o PostgreSQL real do Compose. Cada pacote cria um banco temporário `wallet_test_<aleatório>` (helper em `internal/testutil/pgtest`), aplica as migrations como `wallet_owner`, executa os testes com o papel `wallet_app` e apaga o banco ao final. O banco da aplicação não é tocado.
 
@@ -396,9 +425,23 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestOrderWithinWallet`, `TestHeartbeatKeepsMessageInvisible` | ordem por carteira; processamento longo não deixa a mensagem reaparecer |
 | `TestGracefulShutdown`, `TestStopDeadlineCancelsInFlight` | SIGTERM conclui a mensagem em andamento e devolve as não iniciadas; prazo estourado cancela sem gravar nada |
 
+**Outbox e workers** (`internal/worker`, com SNS e SQS reais; cada teste cria o seu banco e o seu tópico)
+
+| Teste | O que comprova |
+|---|---|
+| `TestEventsArePublishedAsCommitted`, `TestNothingIsPublishedBeforeCommit` | eventos chegam idênticos ao gravado, com grupo, tipo e versão; nada sai antes do commit |
+| `TestOrderPerAggregate` | eventos de uma carteira saem na ordem de `walletVersion`, mesmo com falha e republicação no meio |
+| `TestBrokerUnavailableIsRetriedWithBackoff` | falha no broker registra tentativa e erro, respeita o backoff e não perde evento |
+| `TestTwoPublishersCompete` | dois publishers na mesma outbox: cada evento publicado uma única vez |
+| `TestAbandonedClaimIsRecovered`, `TestLeaseIsRenewedDuringSlowPublish` | reserva abandonada é assumida após o lease; reserva de um publisher vivo não é tomada |
+| `TestRepublishAfterCrashKeepsEventID` | queda entre publicar e marcar: republicação com o mesmo `eventId` e os mesmos bytes, uma única cópia entregue |
+| `TestStopReleasesUnstartedClaims`, `TestOutboxLoopLifecycle` | encerramento libera as reservas não iniciadas; o loop sobe, publica e para |
+| `TestSubscriptionDeadLetters` | entrega do SNS que falha vai para a DLQ da assinatura |
+| `TestReferenceWorkerResolvesPendingReversals`, `TestReferenceWorkerExpiresMissingReferences` | dois loops do worker concluem cada pendência uma única vez; sem referência, expira com `REFERENCE_NOT_FOUND` |
+
 ### Testes de mutação
 
-O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado" e "audiência não conferida". Os mutantes de persistência, de casos de uso, de API e do consumidor exigem PostgreSQL, Keycloak e LocalStack no ar:
+O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado", "audiência não conferida" e "reserva ignora a ordem por agregado". Os mutantes de persistência, de casos de uso, de API, do consumidor e dos workers exigem PostgreSQL, Keycloak e LocalStack no ar:
 
 ```bash
 docker compose up -d --wait postgres keycloak localstack

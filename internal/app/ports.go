@@ -104,9 +104,40 @@ type LedgerRepository interface {
 	Totals(ctx context.Context, walletID domain.WalletID) (netMinor int64, entries int, err error)
 }
 
-// OutboxRepository grava eventos para publicação posterior ao commit.
+// OutboxRepository grava eventos para publicação posterior ao commit e
+// controla a reserva (lease) dos publishers.
 type OutboxRepository interface {
 	Append(ctx context.Context, events ...event.Event) error
+	// Claim reserva para owner, até until, no máximo limit eventos pendentes e
+	// vencidos, apenas o mais antigo (por sequence) de cada agregado, e só
+	// quando não há evento anterior do mesmo agregado ainda não publicado.
+	Claim(ctx context.Context, owner string, now, until time.Time, limit int) ([]OutboxEvent, error)
+	// Renew estende o lease dos eventos ainda reservados por owner.
+	Renew(ctx context.Context, owner string, ids []domain.EventID, until time.Time) error
+	// MarkPublished conclui o evento, se ainda reservado por owner. Devolve
+	// false quando a reserva já não era dele (lease vencido e assumido).
+	MarkPublished(ctx context.Context, id domain.EventID, owner string, at time.Time) (bool, error)
+	// MarkFailed registra a falha, agenda nova tentativa e solta a reserva.
+	MarkFailed(ctx context.Context, id domain.EventID, owner string, next time.Time, lastError string) error
+	// Release solta reservas de owner sem contar tentativa (encerramento).
+	Release(ctx context.Context, owner string, ids []domain.EventID) error
+}
+
+// OutboxEvent é um evento reservado para publicação: o snapshot exato gravado
+// no commit da operação.
+type OutboxEvent struct {
+	ID           domain.EventID
+	AggregateID  string
+	EventType    string
+	EventVersion int
+	Payload      []byte
+	Attempts     int
+}
+
+// EventPublisher entrega um evento ao broker. Republicar o mesmo evento usa o
+// mesmo eventId (deduplicação no broker e nos consumidores).
+type EventPublisher interface {
+	Publish(ctx context.Context, e OutboxEvent) error
 }
 
 // InboxMessage é o registro de uma mensagem recebida por um consumidor.

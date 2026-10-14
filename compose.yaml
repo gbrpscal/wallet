@@ -58,11 +58,11 @@ services:
   localstack:
     image: localstack/localstack:4.14.0
     environment:
-      SERVICES: sqs
+      SERVICES: sqs,sns
     volumes:
       - ./deploy/localstack/init-queues.sh:/etc/localstack/init/ready.d/10-init-queues.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo >/dev/null"]
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wallet-events-audit.fifo >/dev/null"]
       interval: 3s
       timeout: 5s
       retries: 40
@@ -107,6 +107,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-30s}
       DB_LOCK_TIMEOUT: ${DB_LOCK_TIMEOUT:-5s}
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-20}
+      SNS_EVENTS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:wallet-events.fifo
       OIDC_ISSUER: http://localhost:${KEYCLOAK_HOST_PORT:-8180}/realms/wallet
       OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
       OIDC_AUDIENCE: wallet-api

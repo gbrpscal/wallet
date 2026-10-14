@@ -289,6 +289,33 @@ mutate "envelope aceita campos desconhecidos" internal/adapters/sqs/message.go \
   'dec := json.NewDecoder(bytes.NewReader([]byte(body)))
 	dec.DisallowUnknownFields()' 'dec := json.NewDecoder(bytes.NewReader([]byte(body)))' $MQ
 
+# --- Outbox e workers (tag integration; exige PostgreSQL e LocalStack no ar) ------
+WK=./internal/worker/...
+baseline $WK integration
+
+mutate "reserva ignora a ordem por agregado" internal/adapters/postgres/messaging.go \
+  '			  AND NOT EXISTS (
+			      SELECT 1 FROM outbox_events p
+			      WHERE p.aggregate_id = e.aggregate_id
+			        AND p.published_at IS NULL
+			        AND p.sequence < e.sequence)' '' $WK integration
+mutate "reserva ignora lease de outro publisher" internal/adapters/postgres/messaging.go \
+  'AND (e.claimed_until IS NULL OR e.claimed_until < $2)' '' $WK integration
+mutate "reserva ignora o backoff" internal/adapters/postgres/messaging.go \
+  'AND e.next_attempt_at <= $2' '' $WK integration
+mutate "falha de publicação sem agendar nova tentativa" internal/app/outbox.go \
+  'next := r.clock.Now().Add(r.backoff(attempt))' 'next := r.clock.Now()' $WK integration
+mutate "falha de publicação marcada como publicada" internal/app/outbox.go \
+  'if err := r.publisher.Publish(ctx, e); err != nil {' 'if err := r.publisher.Publish(ctx, e); err != nil && false {' $WK integration
+mutate "lease não é renovado" internal/app/outbox.go \
+  'stopRenew := r.renewWhile(pending)' 'stopRenew := func() {}' $WK integration
+mutate "encerramento não libera as reservas" internal/app/outbox.go \
+  '			r.release(pending.remaining())' '			pending.remaining()' $WK integration
+mutate "republicação com outro id de deduplicação" internal/adapters/sns/sns.go \
+  'MessageDeduplicationId: aws.String(e.ID.String()),' 'MessageDeduplicationId: aws.String(e.ID.String() + fmt.Sprintf("%p", &e)),' $WK integration
+mutate "grupo do broker diferente do agregado" internal/adapters/sns/sns.go \
+  'MessageGroupId:         aws.String(e.AggregateID),' 'MessageGroupId:         aws.String("all"),' $WK integration
+
 echo
 echo "mutantes mortos: $killed, problemas: $bad"
 [ "$bad" -eq 0 ]

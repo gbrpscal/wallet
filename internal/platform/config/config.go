@@ -44,6 +44,22 @@ type Config struct {
 	ConsumerVisibility time.Duration
 	ConsumerRetryBase  time.Duration
 	ConsumerRetryMax   time.Duration
+	// Pool do PostgreSQL.
+	DBMaxConns int
+	// Publisher da outbox (D10).
+	SNSEventsTopicARN        string
+	OutboxPublisherEnabled   bool
+	OutboxBatchSize          int
+	OutboxLease              time.Duration
+	OutboxIdleInterval       time.Duration
+	OutboxPublishConcurrency int
+	OutboxRetryBase          time.Duration
+	OutboxRetryMax           time.Duration
+	// Worker de referências pendentes (D4).
+	ReferenceWorkerEnabled     bool
+	ReferenceWorkerInterval    time.Duration
+	ReferenceWorkerBatch       int
+	ReferenceWorkerConcurrency int
 }
 
 // Load lê o ambiente e devolve um Config validado.
@@ -51,15 +67,16 @@ func Load() (Config, error) {
 	var errs []error
 
 	cfg := Config{
-		HTTPAddr:       stringOr("HTTP_ADDR", ":8080"),
-		DatabaseURL:    stringOr("DATABASE_URL", ""),
-		AWSRegion:      stringOr("AWS_REGION", "us-east-1"),
-		AWSEndpointURL: stringOr("AWS_ENDPOINT_URL", ""),
-		WagerQueueName: stringOr("SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
-		OIDCIssuer:     stringOr("OIDC_ISSUER", ""),
-		OIDCJWKSURL:    stringOr("OIDC_JWKS_URL", ""),
-		OIDCAudience:   stringOr("OIDC_AUDIENCE", "wallet-api"),
-		WagerDLQName:   stringOr("SQS_WAGER_DLQ_NAME", "wager-transactions-dlq.fifo"),
+		HTTPAddr:          stringOr("HTTP_ADDR", ":8080"),
+		DatabaseURL:       stringOr("DATABASE_URL", ""),
+		AWSRegion:         stringOr("AWS_REGION", "us-east-1"),
+		AWSEndpointURL:    stringOr("AWS_ENDPOINT_URL", ""),
+		WagerQueueName:    stringOr("SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
+		OIDCIssuer:        stringOr("OIDC_ISSUER", ""),
+		OIDCJWKSURL:       stringOr("OIDC_JWKS_URL", ""),
+		OIDCAudience:      stringOr("OIDC_AUDIENCE", "wallet-api"),
+		WagerDLQName:      stringOr("SQS_WAGER_DLQ_NAME", "wager-transactions-dlq.fifo"),
+		SNSEventsTopicARN: stringOr("SNS_EVENTS_TOPIC_ARN", ""),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -88,6 +105,21 @@ func Load() (Config, error) {
 	cfg.ConsumerVisibility = durationOr("SQS_VISIBILITY_TIMEOUT", 30*time.Second, &errs)
 	cfg.ConsumerRetryBase = durationOr("SQS_RETRY_BACKOFF_BASE", 2*time.Second, &errs)
 	cfg.ConsumerRetryMax = durationOr("SQS_RETRY_BACKOFF_MAX", time.Minute, &errs)
+	cfg.DBMaxConns = intOr("DB_MAX_CONNS", 20, &errs)
+	cfg.OutboxPublisherEnabled = boolOr("OUTBOX_PUBLISHER_ENABLED", true, &errs)
+	cfg.OutboxBatchSize = intOr("OUTBOX_BATCH_SIZE", 50, &errs)
+	cfg.OutboxLease = durationOr("OUTBOX_LEASE", 30*time.Second, &errs)
+	cfg.OutboxIdleInterval = durationOr("OUTBOX_IDLE_INTERVAL", 500*time.Millisecond, &errs)
+	cfg.OutboxPublishConcurrency = intOr("OUTBOX_PUBLISH_CONCURRENCY", 8, &errs)
+	cfg.OutboxRetryBase = durationOr("OUTBOX_RETRY_BASE", time.Second, &errs)
+	cfg.OutboxRetryMax = durationOr("OUTBOX_RETRY_MAX", 5*time.Minute, &errs)
+	cfg.ReferenceWorkerEnabled = boolOr("REFERENCE_WORKER_ENABLED", true, &errs)
+	cfg.ReferenceWorkerInterval = durationOr("REFERENCE_WORKER_INTERVAL", time.Second, &errs)
+	cfg.ReferenceWorkerBatch = intOr("REFERENCE_WORKER_BATCH", 50, &errs)
+	cfg.ReferenceWorkerConcurrency = intOr("REFERENCE_WORKER_CONCURRENCY", 8, &errs)
+	if cfg.OutboxPublisherEnabled && cfg.SNSEventsTopicARN == "" {
+		errs = append(errs, errors.New("SNS_EVENTS_TOPIC_ARN is required when the outbox publisher is enabled"))
+	}
 	if cfg.ConsumerWaitTime > 20*time.Second {
 		errs = append(errs, errors.New("SQS_WAIT_TIME must not exceed 20s"))
 	}

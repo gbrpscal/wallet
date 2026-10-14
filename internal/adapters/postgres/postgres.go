@@ -35,6 +35,7 @@ func NewPool(lc fx.Lifecycle, cfg config.Config) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
+	poolCfg.MaxConns = int32(cfg.DBMaxConns)
 	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)

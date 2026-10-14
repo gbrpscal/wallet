@@ -13,6 +13,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/platform/config"
 	"github.com/gbrpscal/wallet/internal/platform/logging"
+	"github.com/gbrpscal/wallet/internal/worker"
 )
 
 func main() {
@@ -31,5 +32,6 @@ func main() {
 		sqs.Module,
 		app.Module,
 		httpapi.Module,
+		worker.Module,
 	).Run()
 }
