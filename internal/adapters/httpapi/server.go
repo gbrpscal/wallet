@@ -18,26 +18,31 @@ import (
 var Module = fx.Module("httpapi",
 	fx.Provide(
 		NewHealthHandler,
-		NewMux,
+		fx.Annotate(NewOIDCAuthenticator, fx.As(new(Authenticator))),
+		NewAPI,
+		NewHandler,
 	),
 	fx.Invoke(StartServer),
 )
 
-// NewMux registra todas as rotas.
-func NewMux(h *HealthHandler) *http.ServeMux {
+// NewHandler registra todas as rotas: health checks públicos e as rotas
+// autenticadas da API, envolvidas pelos middlewares de correlação e de
+// recuperação de panic.
+func NewHandler(h *HealthHandler, api *API, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", h.Live)
 	mux.HandleFunc("GET /health/ready", h.Ready)
-	return mux
+	api.routes(mux)
+	return withCorrelation(recoverer(log, mux))
 }
 
 // StartServer abre o listener durante o start, para que uma porta ocupada
 // faça a inicialização falhar, e drena as requisições em andamento no stop,
 // dentro do prazo de parada do Fx.
-func StartServer(lc fx.Lifecycle, cfg config.Config, mux *http.ServeMux, health *HealthHandler, log *slog.Logger) {
+func StartServer(lc fx.Lifecycle, cfg config.Config, handler http.Handler, health *HealthHandler, log *slog.Logger) {
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		ReadHeaderTimeout: cfg.HTTPHeaderTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,

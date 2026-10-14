@@ -37,6 +37,21 @@ func TestReferencePolicyBackoff(t *testing.T) {
 	}
 }
 
+// TestReferencePolicyCapsDelay amostra muitas esperas depois de várias
+// tentativas: com o teto de 60s e jitter de ±20%, nenhuma pode passar de 72s.
+// Uma única amostra não bastaria, porque sem o teto a espera seria 64s ±20%,
+// faixa quase toda sobreposta à correta.
+func TestReferencePolicyCapsDelay(t *testing.T) {
+	p := app.DefaultReferencePolicy
+	far := app.ReferenceSchedule{Attempts: 20, ExpiresAt: t0.Add(24 * time.Hour)}
+	for i := 0; i < 500; i++ {
+		got := p.Next(far, t0).NextAttemptAt.Sub(t0)
+		if got < 48*time.Second || got > 72*time.Second {
+			t.Fatalf("capped delay = %v, want 60s ±20%%", got)
+		}
+	}
+}
+
 func TestReferencePolicyNeverSchedulesPastExpiry(t *testing.T) {
 	p := app.DefaultReferencePolicy
 	s := p.Initial(t0)

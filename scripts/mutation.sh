@@ -221,6 +221,36 @@ mutate "retry não repete falha transitória" internal/app/policy.go \
 mutate "cursor aceita versão negativa" internal/app/policy.go \
   '|| c.V != 1 || c.After < 0 {' '|| c.V != 1 {' $APP
 
+# --- HTTP e autenticação (tag integration; exige PostgreSQL e Keycloak no ar) ---------
+API=./internal/adapters/httpapi/...
+baseline $API integration
+
+mutate "provedor opera em nome de outro" internal/adapters/httpapi/handlers.go \
+  'if p.ProviderID == "" || (req.ProviderID != "" && req.ProviderID != p.ProviderID) {' 'if p.ProviderID == "" {' $API integration
+mutate "provedor lê transação de outro" internal/adapters/httpapi/handlers.go \
+  'if err == nil && (t.IsInternal() || t.ProviderID() != principalFrom(r.Context()).ProviderID) {' 'if err == nil && t.IsInternal() {' $API integration
+mutate "rota por id externo sem escopo de provedor" internal/adapters/httpapi/handlers.go \
+  'if providerID != principalFrom(r.Context()).ProviderID {' 'if false {' $API integration
+mutate "scope não conferido" internal/adapters/httpapi/auth.go \
+  'if !p.Has(scope) {' 'if false {' $API integration
+mutate "audiência não conferida" internal/adapters/httpapi/auth.go \
+  'ClientID:             cfg.OIDCAudience,' 'SkipClientIDCheck: true,' $API integration
+mutate "expiração não conferida" internal/adapters/httpapi/auth.go \
+  'SupportedSigningAlgs: []string{oidc.RS256},' 'SupportedSigningAlgs: []string{oidc.RS256}, SkipExpiryCheck: true,' $API integration
+mutate "assinatura não conferida" internal/adapters/httpapi/auth.go \
+  'token, err := a.verifier.Verify(ctx, raw)' 'token, err := oidc.NewVerifier("", nil, &oidc.Config{InsecureSkipSignatureCheck: true, SkipIssuerCheck: true, SkipClientIDCheck: true}).Verify(ctx, raw)' $API integration
+mutate "campos desconhecidos aceitos" internal/adapters/httpapi/problem.go \
+  'dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {' 'if err := dec.Decode(dst); err != nil {' $API integration
+mutate "rejeição respondida como sucesso" internal/adapters/httpapi/handlers.go \
+  'case wagering.Rejected:
+		return http.StatusUnprocessableEntity' 'case wagering.Rejected:
+		return http.StatusOK' $API integration
+mutate "Idempotency-Key opcional" internal/adapters/httpapi/handlers.go \
+  'if key == "" {' 'if false {' $API integration
+mutate "X-Correlation-Id do cliente ignorado" internal/adapters/httpapi/correlation.go \
+  'if domain.ValidateTextID("correlationId", id) != nil {' 'if true {' $API integration
+
 echo
 echo "mutantes mortos: $killed, problemas: $bad"
 [ "$bad" -eq 0 ]

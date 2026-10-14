@@ -46,7 +46,7 @@ internal/app/                casos de uso (Service), portas (UnitOfWork, reposit
 internal/testutil/pgtest/     banco temporário para os testes de integração
 internal/adapters/
   postgres/                  pool, UnitOfWork, repositórios e classificação de erros
-  httpapi/                   servidor, rotas e health checks
+  httpapi/                   servidor, rotas, autenticação OIDC, erros (problem+json), health checks
   sqs/                       cliente, consumidor e publisher
 internal/platform/
   config/  logging/  health/ configuração, logs JSON e readiness
@@ -68,7 +68,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 3 | Domínio puro e testes unitários | concluída |
 | 4 | Persistência: migrations, constraints, repositórios | concluída |
 | 5 | Casos de uso | concluída |
-| 6 | HTTP e autenticação | pendente |
+| 6 | HTTP e autenticação | concluída |
 | 7 | Consumidor SQS | pendente |
 | 8 | Outbox e workers | pendente |
 | 9 | Observabilidade | pendente |
@@ -742,16 +742,149 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
 - A autorização por provedor em `GetTransaction` (busca por id interno) é feita pela camada HTTP (Fase 6).
 - **Como verificar:** `TestTransactionLookupsAreProviderScoped`.
 
-### 4.13 Decisões pendentes
+### 4.13 HTTP e autenticação
+
+A API usa `net/http` (`ServeMux` com padrões de método e rota do Go 1.22+), sem router externo. Health checks são públicos; as demais rotas exigem um access token `client_credentials` do Keycloak com o scope da operação.
+
+| Rota | Scope | Sucesso |
+|---|---|---|
+| `POST /wallets` | `wallets:write` | 201 + `Location` |
+| `GET /wallets/{walletId}` | `wallets:read` | 200 |
+| `GET /wallets/{walletId}/ledger?cursor=&limit=` | `wallets:read` | 200 |
+| `POST /wallets/{walletId}/reconciliation` | `wallets:reconcile` | 200 |
+| `POST /wagering/transactions` | `wagering:write` | 200 / 422 / 202 (abaixo) |
+| `GET /wagering/transactions/{transactionId}` | `wagering:read` | 200 |
+| `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `wagering:read` | 200 |
+| `GET /health/live`, `GET /health/ready` | — | 200 / 503 |
+
+#### D8. Validação de token: `coreos/go-oidc` v3
+
+- **Contexto:** "IdP externo OAuth 2.0/OIDC […] `client_credentials` para comunicação entre serviços. […] Escolha do IdP, validação de credenciais e modelo de permissões justificados."
+- **Opções consideradas:** (a) `coreos/go-oidc` v3; (b) `lestrrat-go/jwx` v3; (c) `golang-jwt` + `keyfunc`.
+- **Prós e contras:**
+  - (a) é a biblioteca OIDC de referência em Go, com cache e rotação de chaves e verificação de assinatura, emissor, audiência e expiração.
+  - (b) é uma suíte JOSE completa, com mais superfície do que o necessário.
+  - (c) exige conferir emissor e audiência à mão.
+- **Escolha e justificativa:** (a). O verificador exige:
+  - assinatura **RS256** (algoritmo fixo) com as chaves do JWKS;
+  - `iss` igual a `OIDC_ISSUER`;
+  - `aud` contendo `wallet-api`;
+  - `exp` válido.
+  
+  O JWKS é buscado sob demanda em `OIDC_JWKS_URL`, então o processo sobe com o Keycloak fora do ar; as requisições autenticadas dão 401 até ele voltar. O motivo exato da rejeição vai só para o log.
+- **IdP:** Keycloak 26.8.1 no Compose, com o realm `wallet` importado de [deploy/keycloak/wallet-realm.json](deploy/keycloak/wallet-realm.json).
+- **Critério impactado:** Modelagem e arquitetura e Testes.
+- **Como verificar:** `TestAuthenticationFailures`, com o Keycloak real: token ausente, esquema não Bearer, token malformado, assinatura adulterada, audiência errada e token expirado dão 401, sem efeito financeiro. Mutantes "audiência não conferida", "expiração não conferida" e "assinatura não conferida".
+- **Limitações:** não há revogação ativa (introspecção); um token vale até expirar (5 min por padrão no realm).
+
+#### D8. Emissor fixo no Keycloak
+
+- **Contexto:** o `iss` de um token do Keycloak depende do endereço usado para pedi-lo (`localhost:8180` pelo host, `keycloak:8080` pela rede do Compose).
+- **Opções consideradas:** (a) hostname fixo; (b) tokens só pela rede interna.
+- **Prós e contras:**
+  - (a) aceita tokens pedidos de qualquer lado.
+  - (b) faria um token pedido pelo host (curl, Postman) ser rejeitado.
+- **Escolha e justificativa:** (a). `KC_HOSTNAME=http://localhost:8180` com `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true`. Todo token tem `iss = http://localhost:8180/realms/wallet`, e os endpoints de backchannel (token, JWKS) respondem pelo endereço usado na requisição. A aplicação valida esse emissor e busca o JWKS em `http://keycloak:8080/...`.
+- **Como verificar:** os testes de integração pedem tokens por `keycloak:8080`, e o fluxo manual do README os pede por `localhost:8180`; os dois são aceitos.
+- **Limitações:** mudar a porta publicada exige ajustar `KEYCLOAK_HOST_PORT` (o Compose deriva o emissor dela).
+
+#### D8. Identificação do provedor: claim `provider_id`
+
+- **Contexto:** "Isolamento entre provedores, inclusive em consultas e replays."
+- **Opções consideradas:** (a) claim fixo `provider_id` por client, via *hardcoded claim mapper*; (b) `client_id` (`azp`) como providerId.
+- **Prós e contras:**
+  - (a) desacopla o nome do client do id de negócio e permite vários clients por provedor.
+  - (b) dispensa o mapper, mas acopla os dois.
+- **Escolha e justificativa:** (a).
+  - **Envio:** o `providerId` do corpo precisa ser igual ao do token; diferente resulta em 403, e nada é processado (nem replay).
+  - **Consulta por id:** só devolve transações do próprio provedor. As de outro provedor, e o `OPENING` interno, dão 404 sem revelar a existência.
+  - **Consulta por id externo:** a rota com `providerId` diferente do token dá 403.
+  - Um token com scope de wagering mas sem `provider_id` dá 403.
+- **Como verificar:** `TestProviderIsolation` e os mutantes "provedor opera em nome de outro", "provedor lê transação de outro" e "rota por id externo sem escopo de provedor".
+
+#### D8. Modelo de permissões: scopes por operação
+
+- **Opções consideradas:** (a) scopes OAuth por operação; (b) dois papéis grosseiros (provider e internal); (c) realm roles por operação.
+- **Prós e contras:**
+  - (a) dá menor privilégio por operação e é o mecanismo padrão do `client_credentials`.
+  - (b) dá a qualquer client interno acesso a tudo.
+  - (c) é equivalente a (a), mas fora do padrão OAuth para esse fluxo.
+- **Escolha e justificativa:** (a). Scopes: `wagering:write`, `wagering:read`, `wallets:read`, `wallets:write` e `wallets:reconcile`. Token sem o scope da rota dá 403 com `WWW-Authenticate: Bearer error="insufficient_scope"`, e o handler não roda.
+- **Clients provisionados** (segredos `<client>-secret`, somente locais):
+
+| Client | `provider_id` | Scopes | Uso |
+|---|---|---|---|
+| `wallet-backoffice` | — | `wallets:*` | operações internas |
+| `provider-a` | `provider-a` | `wagering:*` | provedor |
+| `provider-b` | `provider-b` | `wagering:*` | provedor (testes de isolamento) |
+| `provider-short-lived` | `provider-a` | `wagering:*` | teste de expiração (token de 2s) |
+| `no-audience` | `provider-a` | `wagering:*` | teste de audiência (sem `wallet-api`) |
+
+- **Como verificar:** `TestAuthorizationByScope` (6 combinações proibidas; nenhuma movimenta saldo) e o mutante "scope não conferido".
+- **Limitações:** o realm é gerado para uso local, com segredos fixos; em produção os segredos viriam de um cofre.
+
+#### Leitura de carteira e ledger: só clients internos
+
+- **Opções consideradas:** (a) só clients com `wallets:read`; (b) provedor lê carteiras em que já operou; (c) qualquer autenticado.
+- **Prós e contras:**
+  - (a) não exige inventar uma regra de "dono" da carteira, que o enunciado não define.
+  - (b) expõe ao provedor operações de outros provedores no ledger.
+  - (c) viola o isolamento.
+- **Escolha e justificativa:** (a). O provedor vê o saldo resultante nas respostas das próprias operações.
+
+#### D6. Mapeamento para HTTP
+
+| Situação | Status | Corpo |
+|---|---|---|
+| Entrada inválida (`KindValidation`) | 400 | problem+json |
+| Token ausente ou inválido | 401 + `WWW-Authenticate` | problem+json `UNAUTHENTICATED` |
+| Sem scope, provedor divergente | 403 | problem+json `FORBIDDEN` |
+| Recurso inexistente (`KindNotFound`) | 404 | problem+json |
+| Conflito (`KindConflict`) | 409 | problem+json |
+| `Content-Type` diferente de JSON | 415 | problem+json `UNSUPPORTED_MEDIA_TYPE` |
+| Operação **rejeitada** e persistida (`REJECTED`) | **422** | corpo da transação, com `failureCode` |
+| Operação **pendente** (`PENDING_REFERENCE`) | **202** + `Location` | corpo da transação |
+| Operação processada | 200 | corpo da transação |
+| Falha transitória com retries esgotados | 503 + `Retry-After: 1` | problem+json `UNAVAILABLE` |
+| Invariante violada ou erro inesperado | 500 | problem+json, sem detalhes internos |
+
+- **Formato de erro:** RFC 9457 (`application/problem+json`) com `type`, `title`, `status` e `detail`, mais as extensões `code` (estável) e `correlationId`. A alternativa (JSON próprio) foi descartada por não ser padrão.
+- **Rejeição:** 422 com o mesmo corpo do sucesso (`transactionId`, `status: REJECTED`, `failureCode`, saldo observado), distinguível de 400 e 409. Responder 200 com `status: REJECTED` foi descartado, porque o enunciado pede códigos distinguíveis.
+- **Replay:** mesmo status e corpo do original, com `idempotentReplay: true`. Uma rejeição reproduzida continua 422. "Sempre 200" foi descartado, porque esconderia a rejeição de quem olha o status.
+- **Como verificar:** `TestOperationResponses`, `TestInputAndConflictErrors`, `TestErrorMapping`, `TestStatusFor` e o mutante "rejeição respondida como sucesso".
+
+#### Contrato de entrada
+
+- **`Idempotency-Key` obrigatório** em `POST /wagering/transactions`. Ausente resulta em 400, com uma mensagem que aponta o header. O servidor nunca substitui a chave por outra calculada.
+- **JSON estrito:**
+  - `Content-Type: application/json`;
+  - até 64 KiB;
+  - **campos desconhecidos rejeitados** (um nome de campo errado não vira, em silêncio, uma operação diferente);
+  - um único objeto por corpo.
+  
+  A alternativa de ignorar campos extras foi descartada.
+- **Money:** `amount` precisa ser string. Um número JSON (que passaria por ponto flutuante) resulta em `INVALID_AMOUNT`.
+- **Como verificar:** `TestInputAndConflictErrors`, `TestDecodeJSON`, `TestMoneyInputRejectsNumbers` e os mutantes "campos desconhecidos aceitos" e "Idempotency-Key opcional".
+
+#### Correlação
+
+- **Opções consideradas:** (a) usar o `X-Correlation-Id` do cliente quando válido e gerar um UUIDv7 caso contrário; (b) sempre gerar.
+- **Escolha e justificativa:** (a). Assim o provedor pode correlacionar com os sistemas dele. O id volta no header da resposta e é gravado na transação, nos eventos da outbox e nos corpos de erro. Um valor inválido (vazio, com mais de 255 bytes ou com caracteres de controle) é substituído.
+- **Como verificar:** `TestCorrelationID` e o mutante "X-Correlation-Id do cliente ignorado".
+
+#### Outros comportamentos
+
+- Panic em handler vira 500 problem+json, sem derrubar o processo (`TestRecovererReturnsProblem`).
+- A readiness continua cobrindo só PostgreSQL e SQS, como pede o enunciado; o Keycloak não entra nela.
+
+### 4.14 Decisões pendentes
 
 | # | Decisão | Fase |
 |---|---|---|
-| D6 | Mapeamento de códigos para HTTP | 6 |
-| D8 | Validação de token, permissões e identificação do provedor | 6 |
 | D9 | `MessageGroupId`, deduplicação, visibility timeout, `maxReceiveCount`, mensagens inválidas | 7 |
 | D10 | Destino dos eventos e contrato de roteamento | 8 |
 
-### 4.14 Composição com Fx e ciclo de vida (parcial)
+### 4.15 Composição com Fx e ciclo de vida (parcial)
 
 - **Contexto:** "Fx compõe configuração, conexões, repositórios, casos de uso, handlers e workers […] fechamento das dependências depois dos componentes que as utilizam."
 - **Implementado até aqui:**
@@ -764,7 +897,7 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
 - **Como verificar:** hoje, de forma manual: `docker compose stop app` mostra no log o hook do servidor executando antes do hook do pool. O teste automatizado da composição Fx será feito na Fase 10.
 - **Pendente:** workers (consumidor, publisher, referências) e o shutdown seguro do consumidor SQS.
 
-### 4.15 Ambiente, ferramentas e testes
+### 4.16 Ambiente, ferramentas e testes
 
 #### Toolchain sem instalação local
 
@@ -836,10 +969,11 @@ docker compose run --rm tools go test -race -tags=integration ./internal/adapter
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 57 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência e 12 de casos de uso (os dois últimos grupos com o PostgreSQL no ar).
+- **Como verificar:** o comando abaixo, que hoje dá 68 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência, 12 de casos de uso e 11 de HTTP e autenticação (os três últimos grupos com PostgreSQL e Keycloak no ar).
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
+- **Mutantes sobre comportamento aleatório:** o jitter do backoff faz o resultado de um teste variar entre execuções. Três rodadas seguidas mostraram que o mutante "backoff sem teto" às vezes sobrevivia: sem o teto, a espera seria 64s ±20%, quase toda sobreposta à faixa correta de 60s ±20%, e uma única amostra não bastava. `TestReferencePolicyCapsDelay` passou a amostrar 500 vezes e exigir que nenhuma espera passe de 72s; o mutante é morto de forma estável. Por isso, mudanças em código com aleatoriedade devem rodar o script mais de uma vez.
 - **Limitações:** só cobre os defeitos listados; não substitui revisão.
 
 #### Configuração e logs
@@ -858,8 +992,8 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11); `TestFiftyIdenticalBetsInParallel`, `TestTwoBetsOf80OnWalletWith100`, `TestIndependentWalletsInParallel` (§4.12) | testes com ≥ 3 processos |
 | Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12) | HTTP × SQS |
 | Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12) | consumidor, publisher, loop do worker, DLQ, shutdown |
-| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.14) | autenticação e autorização |
-| Testes | 10 | testes unitários e de integração (repositórios e casos de uso) com PostgreSQL real, todos com `-race`; 57/57 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso (§4.15) | isolamento entre provedores na API, paralelismo multiprocesso, interrupção |
+| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.15); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
+| Testes | 10 | testes unitários e de integração (repositórios, casos de uso e API com Keycloak real) com PostgreSQL real, todos com `-race`; 68/68 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso, 11 de HTTP e autenticação (§4.16) | paralelismo multiprocesso, interrupção, SQS |
 | Observabilidade | 5 | logs JSON; `/health/live`; `/health/ready` com PostgreSQL e SQS | IDs nos logs; métricas |
 | Documentação | 5 | este documento e o README | revisão final |
 
@@ -883,8 +1017,8 @@ docker compose run --rm tools bash scripts/mutation.sh
 
 ## 7. Limitações e trabalho não concluído
 
-- HTTP, autenticação, consumidor SQS, publisher da outbox, loop do worker de referências e métricas ainda não foram implementados (ver §2).
-- As decisões D6 (parte HTTP), D8, D9 e D10 estão pendentes (§4.13).
+- Consumidor SQS, publisher da outbox, loop do worker de referências e métricas ainda não foram implementados (ver §2).
+- As decisões D9 e D10 estão pendentes (§4.14).
 - A concorrência só foi demonstrada com um processo; a prova com ≥ 3 processos independentes fica para a Fase 10.
 - O banco não confere que a transação está `PROCESSED` quando o seu lançamento é gravado (§4.11).
 - Moedas limitadas a BRL, USD e EUR, todas com 2 casas decimais.

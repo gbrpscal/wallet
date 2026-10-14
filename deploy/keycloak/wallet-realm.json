@@ -1,5 +1,270 @@
 {
-  "realm": "wallet",
+  "accessTokenLifespan": 300,
+  "clientScopes": [
+    {
+      "attributes": {
+        "display.on.consent.screen": "false",
+        "include.in.token.scope": "true"
+      },
+      "name": "wagering:write",
+      "protocol": "openid-connect"
+    },
+    {
+      "attributes": {
+        "display.on.consent.screen": "false",
+        "include.in.token.scope": "true"
+      },
+      "name": "wagering:read",
+      "protocol": "openid-connect"
+    },
+    {
+      "attributes": {
+        "display.on.consent.screen": "false",
+        "include.in.token.scope": "true"
+      },
+      "name": "wallets:read",
+      "protocol": "openid-connect"
+    },
+    {
+      "attributes": {
+        "display.on.consent.screen": "false",
+        "include.in.token.scope": "true"
+      },
+      "name": "wallets:write",
+      "protocol": "openid-connect"
+    },
+    {
+      "attributes": {
+        "display.on.consent.screen": "false",
+        "include.in.token.scope": "true"
+      },
+      "name": "wallets:reconcile",
+      "protocol": "openid-connect"
+    }
+  ],
+  "clients": [
+    {
+      "attributes": {},
+      "clientAuthenticatorType": "client-secret",
+      "clientId": "wallet-backoffice",
+      "defaultClientScopes": [
+        "wallets:read",
+        "wallets:write",
+        "wallets:reconcile"
+      ],
+      "description": "Operações internas: abertura, consulta e reconciliação de carteiras",
+      "directAccessGrantsEnabled": false,
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "implicitFlowEnabled": false,
+      "name": "wallet-backoffice",
+      "optionalClientScopes": [],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "included.custom.audience": "wallet-api",
+            "introspection.token.claim": "true"
+          },
+          "name": "audience-wallet-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper"
+        }
+      ],
+      "publicClient": false,
+      "secret": "wallet-backoffice-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false
+    },
+    {
+      "attributes": {},
+      "clientAuthenticatorType": "client-secret",
+      "clientId": "provider-a",
+      "defaultClientScopes": [
+        "wagering:write",
+        "wagering:read"
+      ],
+      "description": "Provedor de jogos A",
+      "directAccessGrantsEnabled": false,
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "implicitFlowEnabled": false,
+      "name": "provider-a",
+      "optionalClientScopes": [],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "included.custom.audience": "wallet-api",
+            "introspection.token.claim": "true"
+          },
+          "name": "audience-wallet-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper"
+        },
+        {
+          "config": {
+            "access.token.claim": "true",
+            "claim.name": "provider_id",
+            "claim.value": "provider-a",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "jsonType.label": "String",
+            "userinfo.token.claim": "false"
+          },
+          "name": "provider-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper"
+        }
+      ],
+      "publicClient": false,
+      "secret": "provider-a-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false
+    },
+    {
+      "attributes": {},
+      "clientAuthenticatorType": "client-secret",
+      "clientId": "provider-b",
+      "defaultClientScopes": [
+        "wagering:write",
+        "wagering:read"
+      ],
+      "description": "Provedor de jogos B",
+      "directAccessGrantsEnabled": false,
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "implicitFlowEnabled": false,
+      "name": "provider-b",
+      "optionalClientScopes": [],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "included.custom.audience": "wallet-api",
+            "introspection.token.claim": "true"
+          },
+          "name": "audience-wallet-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper"
+        },
+        {
+          "config": {
+            "access.token.claim": "true",
+            "claim.name": "provider_id",
+            "claim.value": "provider-b",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "jsonType.label": "String",
+            "userinfo.token.claim": "false"
+          },
+          "name": "provider-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper"
+        }
+      ],
+      "publicClient": false,
+      "secret": "provider-b-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false
+    },
+    {
+      "attributes": {
+        "access.token.lifespan": "2"
+      },
+      "clientAuthenticatorType": "client-secret",
+      "clientId": "provider-short-lived",
+      "defaultClientScopes": [
+        "wagering:write",
+        "wagering:read"
+      ],
+      "description": "Teste: token do provedor A com validade de 2 segundos",
+      "directAccessGrantsEnabled": false,
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "implicitFlowEnabled": false,
+      "name": "provider-short-lived",
+      "optionalClientScopes": [],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "included.custom.audience": "wallet-api",
+            "introspection.token.claim": "true"
+          },
+          "name": "audience-wallet-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper"
+        },
+        {
+          "config": {
+            "access.token.claim": "true",
+            "claim.name": "provider_id",
+            "claim.value": "provider-a",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "jsonType.label": "String",
+            "userinfo.token.claim": "false"
+          },
+          "name": "provider-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper"
+        }
+      ],
+      "publicClient": false,
+      "secret": "provider-short-lived-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false
+    },
+    {
+      "attributes": {},
+      "clientAuthenticatorType": "client-secret",
+      "clientId": "no-audience",
+      "defaultClientScopes": [
+        "wagering:write",
+        "wagering:read"
+      ],
+      "description": "Teste: token do provedor A sem a audiência wallet-api",
+      "directAccessGrantsEnabled": false,
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "implicitFlowEnabled": false,
+      "name": "no-audience",
+      "optionalClientScopes": [],
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "config": {
+            "access.token.claim": "true",
+            "claim.name": "provider_id",
+            "claim.value": "provider-a",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "jsonType.label": "String",
+            "userinfo.token.claim": "false"
+          },
+          "name": "provider-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper"
+        }
+      ],
+      "publicClient": false,
+      "secret": "no-audience-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false
+    }
+  ],
+  "defaultDefaultClientScopes": [],
+  "defaultOptionalClientScopes": [],
   "enabled": true,
+  "realm": "wallet",
   "sslRequired": "none"
 }

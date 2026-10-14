@@ -32,6 +32,10 @@ type Config struct {
 	ReferenceTTL         time.Duration
 	ReferenceBaseDelay   time.Duration
 	ReferenceMaxDelay    time.Duration
+	// Validação de tokens (D8).
+	OIDCIssuer   string
+	OIDCJWKSURL  string
+	OIDCAudience string
 }
 
 // Load lê o ambiente e devolve um Config validado.
@@ -44,10 +48,16 @@ func Load() (Config, error) {
 		AWSRegion:      stringOr("AWS_REGION", "us-east-1"),
 		AWSEndpointURL: stringOr("AWS_ENDPOINT_URL", ""),
 		WagerQueueName: stringOr("SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
+		OIDCIssuer:     stringOr("OIDC_ISSUER", ""),
+		OIDCJWKSURL:    stringOr("OIDC_JWKS_URL", ""),
+		OIDCAudience:   stringOr("OIDC_AUDIENCE", "wallet-api"),
 	}
 
 	if cfg.DatabaseURL == "" {
 		errs = append(errs, errors.New("DATABASE_URL is required"))
+	}
+	if cfg.OIDCIssuer == "" || cfg.OIDCJWKSURL == "" {
+		errs = append(errs, errors.New("OIDC_ISSUER and OIDC_JWKS_URL are required"))
 	}
 
 	if err := cfg.LogLevel.UnmarshalText([]byte(stringOr("LOG_LEVEL", "info"))); err != nil {

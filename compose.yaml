@@ -39,6 +39,11 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       KC_HEALTH_ENABLED: "true"
+      # Emissor fixo: tokens pedidos pelo host (localhost:8180) ou pela rede
+      # interna (keycloak:8080) têm o mesmo `iss`; endpoints de backchannel
+      # (token, JWKS) respondem pelo endereço usado na requisição.
+      KC_HOSTNAME: http://localhost:${KEYCLOAK_HOST_PORT:-8180}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
     volumes:
       - ./deploy/keycloak:/opt/keycloak/data/import:ro
     ports:
@@ -102,6 +107,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-30s}
       DB_LOCK_TIMEOUT: ${DB_LOCK_TIMEOUT:-5s}
+      OIDC_ISSUER: http://localhost:${KEYCLOAK_HOST_PORT:-8180}/realms/wallet
+      OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+      OIDC_AUDIENCE: wallet-api
       REFERENCE_MAX_ATTEMPTS: ${REFERENCE_MAX_ATTEMPTS:-10}
       REFERENCE_TTL: ${REFERENCE_TTL:-10m}
       REFERENCE_BACKOFF_BASE: ${REFERENCE_BACKOFF_BASE:-1s}
@@ -128,6 +136,10 @@ services:
       <<: *aws-env
       DATABASE_URL: *db-app-url
       DATABASE_OWNER_URL: *db-owner-url
+      OIDC_ISSUER: http://localhost:${KEYCLOAK_HOST_PORT:-8180}/realms/wallet
+      OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+      OIDC_TOKEN_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/token
+      OIDC_AUDIENCE: wallet-api
       # Comandos do goose rodados a partir do container tools.
       GOOSE_DRIVER: postgres
       GOOSE_DBSTRING: *db-owner-url

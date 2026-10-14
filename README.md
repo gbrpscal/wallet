@@ -94,6 +94,9 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 | `REFERENCE_MAX_ATTEMPTS` | `10` | Tentativas do worker para uma reversão que espera a transação referenciada |
 | `REFERENCE_TTL` | `10m` | Prazo máximo de espera, contado da criação; o que vier primeiro (tentativas ou prazo) encerra com `REFERENCE_NOT_FOUND` |
 | `REFERENCE_BACKOFF_BASE` / `REFERENCE_BACKOFF_MAX` | `1s` / `60s` | Backoff exponencial entre tentativas (com ±20% de jitter) |
+| `OIDC_ISSUER` | *(obrigatória)* | Emissor esperado nos tokens (`http://localhost:8180/realms/wallet` no Compose) |
+| `OIDC_JWKS_URL` | *(obrigatória)* | Chaves públicas do Keycloak (`http://keycloak:8080/.../certs` no Compose) |
+| `OIDC_AUDIENCE` | `wallet-api` | Audiência exigida nos tokens |
 | `AWS_REGION` | `us-east-1` | Região do SQS |
 | `AWS_ENDPOINT_URL` | — | Endpoint do SQS (LocalStack) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` / `test` | Credenciais (lidas pelo SDK da AWS) |
@@ -170,7 +173,78 @@ docker compose run --rm tools curl -s http://app:8080/health/ready
 - `/health/live` responde `200 {"status":"ok"}` enquanto o processo está de pé.
 - `/health/ready` responde `200` com `{"status":"ok","checks":{"postgres":"ok","sqs":"ok"}}`, ou `503` quando alguma dependência está indisponível ou o processo está encerrando.
 
-*Pendente (Fases 5 e 6):* abertura de carteira, operações, consultas, reconciliação e obtenção de token no Keycloak.
+### Autenticação
+
+As demais rotas exigem um access token `client_credentials` do Keycloak. O realm `wallet` é importado automaticamente na subida, com estes clients (segredos de uso local, no formato `<client>-secret`):
+
+| Client | Provedor (`provider_id`) | Scopes | Pode |
+|---|---|---|---|
+| `wallet-backoffice` | — | `wallets:read`, `wallets:write`, `wallets:reconcile` | abrir e consultar carteiras, ledger e reconciliação |
+| `provider-a` | `provider-a` | `wagering:write`, `wagering:read` | enviar e consultar as próprias operações |
+| `provider-b` | `provider-b` | `wagering:write`, `wagering:read` | idem, para o provedor B |
+
+Os clients `provider-short-lived` (token de 2 segundos) e `no-audience` (sem a audiência `wallet-api`) existem só para os testes de rejeição. O console administrativo fica em `http://localhost:8180` (`admin`/`admin`).
+
+### Fluxo completo
+
+Os comandos abaixo rodam dentro do container `tools`, sem nada instalado no host. Abra um shell nele:
+
+```bash
+docker compose run --rm tools bash
+```
+
+Dentro do shell, defina os endereços e uma função que obtém tokens:
+
+```bash
+KC=http://keycloak:8080/realms/wallet/protocol/openid-connect/token; API=http://app:8080
+tok() { curl -s -u "$1:$1-secret" -d grant_type=client_credentials $KC | sed -E 's/.*"access_token":"([^"]+)".*/\1/'; }
+BO=$(tok wallet-backoffice); PA=$(tok provider-a)
+```
+
+Abra uma carteira com 1000.00 (resposta `201`, com `id`, `playerId`, `balance` e `version: 1`):
+
+```bash
+curl -s -X POST $API/wallets -H "Authorization: Bearer $BO" -H 'Content-Type: application/json' \
+  -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
+```
+
+Guarde o `id` devolvido e envie a aposta de 25.00 (resposta `200`, `status: PROCESSED`, `balance: 975.00`). Repetir o mesmo comando devolve o mesmo resultado com `idempotentReplay: true`:
+
+```bash
+WALLET=<id devolvido>
+curl -s -X POST $API/wagering/transactions -H "Authorization: Bearer $PA" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: provider-a:transaction-123' \
+  -d "{\"providerId\":\"provider-a\",\"externalTransactionId\":\"transaction-123\",\"playerId\":\"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1\",\"walletId\":\"$WALLET\",\"roundId\":\"round-987\",\"gameId\":\"fortune-chimp\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}"
+```
+
+Consultas e reconciliação (a reconciliação devolve `consistent: true` e `checkedEntries: 2`):
+
+```bash
+curl -s $API/wallets/$WALLET -H "Authorization: Bearer $BO"
+curl -s "$API/wallets/$WALLET/ledger?limit=50" -H "Authorization: Bearer $BO"
+curl -s -X POST $API/wallets/$WALLET/reconciliation -H "Authorization: Bearer $BO"
+curl -s $API/providers/provider-a/wagering/transactions/transaction-123 -H "Authorization: Bearer $PA"
+```
+
+**Pelo host:** os mesmos comandos funcionam com `KC=http://localhost:8180/realms/wallet/protocol/openid-connect/token` e `API=http://localhost:8080`. O emissor dos tokens é o mesmo nos dois casos.
+
+### Respostas e erros
+
+| Situação | Status |
+|---|---|
+| Operação processada | `200` |
+| Operação rejeitada por regra de negócio (ex.: `INSUFFICIENT_FUNDS`), já persistida | `422`, com o corpo da transação e `failureCode` |
+| Operação aguardando referência (`PENDING_REFERENCE`) | `202`, com `Location` para acompanhar |
+| Replay | o mesmo status do original, com `idempotentReplay: true` |
+| Entrada inválida (campo, valor, header `Idempotency-Key` ausente, campo desconhecido) | `400` |
+| Token ausente, inválido ou expirado | `401` |
+| Sem o scope, ou `providerId` diferente do token | `403` |
+| Carteira ou transação inexistente (ou de outro provedor) | `404` |
+| Mesma chave com outro conteúdo; mesma operação com outra chave; carteira duplicada | `409` |
+| `Content-Type` diferente de `application/json` | `415` |
+| Indisponibilidade temporária | `503`, com `Retry-After` |
+
+Os erros seguem a RFC 9457 (`application/problem+json`), com `code` estável e `correlationId`. Envie `X-Correlation-Id` para correlacionar com os seus sistemas; se não enviar, o serviço gera um id e o devolve no mesmo header. O catálogo completo de códigos está em [ARCHITECTURE.md](ARCHITECTURE.md) (§4.9 e §4.13).
 
 ## Testes
 
@@ -188,20 +262,21 @@ docker compose run --rm tools go test -race ./...
 | `internal/domain/event` | envelope, tipo e versão, formato de valores e datas |
 | `internal/domain` | erros tipados, IDs, ausência de ponto flutuante, isolamento do domínio |
 | `internal/app` | política de espera (backoff, teto, expiração), retry de falhas transitórias, cursor do ledger |
+| `internal/adapters/httpapi` | header `Authorization`, JSON estrito, Money só como string, mapeamento de erros para HTTP, recuperação de panic |
 
-### Testes de integração (persistência e casos de uso)
+### Testes de integração (persistência, casos de uso e API)
 
 Os testes com a tag `integration` usam o PostgreSQL real do Compose. Cada pacote cria um banco temporário `wallet_test_<aleatório>` (helper em `internal/testutil/pgtest`), aplica as migrations como `wallet_owner`, executa os testes com o papel `wallet_app` e apaga o banco ao final. O banco da aplicação não é tocado.
 
 ```bash
-docker compose up -d --wait postgres
+docker compose up -d --wait postgres keycloak
 ```
 
 ```bash
-docker compose run --rm tools go test -race -tags=integration ./internal/adapters/postgres/... ./internal/app/...
+docker compose run --rm tools go test -race -tags=integration ./internal/...
 ```
 
-Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL` (papel `wallet_owner`) apontando para o PostgreSQL e rode `go test -race -tags=integration ./internal/adapters/postgres/... ./internal/app/...`.
+Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL` (papel `wallet_owner`) apontando para o PostgreSQL e rode `go test -race -tags=integration ./internal/...`. Os testes da API também exigem `OIDC_ISSUER`, `OIDC_JWKS_URL` e `OIDC_TOKEN_URL` (já definidos no container `tools`).
 
 **Persistência** (`internal/adapters/postgres`)
 
@@ -238,12 +313,23 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestReconciliation` | reconciliação consistente e detecção de divergência (log e resposta) sem alterar o saldo |
 | `TestLedgerPagination`, `TestTransactionLookupsAreProviderScoped`, `TestSameKeyFromAnotherProviderIsIndependent` | cursor opaco e limites; consultas e replays isolados por provedor |
 
+**API** (`internal/adapters/httpapi`, com o Keycloak real e tokens `client_credentials` de verdade)
+
+| Teste | O que comprova |
+|---|---|
+| `TestSpecificationFlow` | os exemplos do enunciado: abertura de 1000.00, aposta de 25.00 (975.00), replay, reconciliação com `checkedEntries: 2`, consultas e paginação |
+| `TestAuthenticationFailures` | token ausente, esquema não Bearer, malformado, assinatura adulterada, audiência errada e expirado resultam em `401`, sem efeito financeiro |
+| `TestAuthorizationByScope` | cada client só acessa as rotas dos seus scopes (`403`), sem efeito financeiro |
+| `TestProviderIsolation` | provedor não opera, não faz replay e não consulta em nome de outro; o `404` não vaza dados |
+| `TestOperationResponses`, `TestInputAndConflictErrors` | `422` com o corpo da rejeição, `202` com `Location`, `400`, `404`, `409` e `415`; erros corrigíveis não consomem a chave |
+| `TestWalletRules`, `TestCorrelationID` | abertura com zero, carteira duplicada, `X-Correlation-Id` propagado até a outbox |
+
 ### Testes de mutação
 
-O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE" e "worker ignora o horário agendado". Os mutantes de persistência e de casos de uso exigem o PostgreSQL no ar:
+O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado" e "audiência não conferida". Os mutantes de persistência, de casos de uso e de API exigem PostgreSQL e Keycloak no ar:
 
 ```bash
-docker compose up -d --wait postgres
+docker compose up -d --wait postgres keycloak
 ```
 
 ```bash
