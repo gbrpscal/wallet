@@ -22,8 +22,8 @@ var Module = fx.Module("postgres",
 	),
 )
 
-func newUnitOfWork(pool *pgxpool.Pool, cfg config.Config) *UnitOfWork {
-	return NewUnitOfWork(pool, cfg.DBLockTimeout)
+func newUnitOfWork(pool *pgxpool.Pool, cfg config.Config, metrics app.Metrics) *UnitOfWork {
+	return NewUnitOfWork(pool, cfg.DBLockTimeout, metrics)
 }
 
 // NewPool cria o pool. As conexões são abertas sob demanda, então um banco

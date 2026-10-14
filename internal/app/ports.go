@@ -121,6 +121,9 @@ type OutboxRepository interface {
 	MarkFailed(ctx context.Context, id domain.EventID, owner string, next time.Time, lastError string) error
 	// Release solta reservas de owner sem contar tentativa (encerramento).
 	Release(ctx context.Context, owner string, ids []domain.EventID) error
+	// Backlog devolve quantos eventos ainda não foram publicados e o instante
+	// do mais antigo (zero quando não há pendências).
+	Backlog(ctx context.Context) (pending int, oldest time.Time, err error)
 }
 
 // OutboxEvent é um evento reservado para publicação: o snapshot exato gravado
@@ -132,6 +135,8 @@ type OutboxEvent struct {
 	EventVersion int
 	Payload      []byte
 	Attempts     int
+	// OccurredAt é o instante do evento (o do commit da operação).
+	OccurredAt time.Time
 }
 
 // EventPublisher entrega um evento ao broker. Republicar o mesmo evento usa o

@@ -11,11 +11,14 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/prometheus/client_golang/prometheus"
 
 	wsqs "github.com/gbrpscal/wallet/internal/adapters/sqs"
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/domain/event"
 	"github.com/gbrpscal/wallet/internal/domain/wagering"
+	"github.com/gbrpscal/wallet/internal/platform/metrics"
+	"github.com/gbrpscal/wallet/internal/platform/metrics/metricstest"
 )
 
 func TestConsumesOperation(t *testing.T) {
@@ -107,7 +110,8 @@ func TestHTTPAndSQSShareIdempotency(t *testing.T) {
 
 func TestInvalidMessagesGoToDeadLetterQueue(t *testing.T) {
 	q := newQueues(t)
-	consumer(t, q, nil)
+	reg := prometheus.NewRegistry()
+	consumerWith(t, q, svc, metrics.New(reg))
 	w := openWallet(t, "100.00")
 	valid := envelope("msg-valid", w, "inv-ok", "BET", "1.00", "")
 
@@ -122,9 +126,11 @@ func TestInvalidMessagesGoToDeadLetterQueue(t *testing.T) {
 		"zero bet":       {envelope("msg-zero", w, "inv-zero", "BET", "0.00", ""), "AMOUNT_MUST_BE_POSITIVE"},
 	}
 	want := map[string]string{}
+	perCode := map[string]float64{}
 	for _, c := range cases {
 		send(t, q, w.id, c.body)
 		want[c.body] = c.code
+		perCode[c.code]++
 	}
 	letters := deadLetters(t, q, len(cases))
 	for _, m := range letters {
@@ -140,6 +146,12 @@ func TestInvalidMessagesGoToDeadLetterQueue(t *testing.T) {
 	eventually(t, 10*time.Second, "main queue drained", func() bool { return queueDepth(t, q.url) == 0 })
 	if balance(t, w) != "100.00" || ledgerEntries(t, w) != 1 {
 		t.Fatalf("invalid messages moved money: %s", balance(t, w))
+	}
+	for code, n := range perCode {
+		labels := map[string]string{"queue": q.dlqName, "error_code": code}
+		if got := metricstest.Value(t, reg, "wallet_dead_letters_total", labels); got != n {
+			t.Errorf("dead letters %v = %v, want %v", labels, got, n)
+		}
 	}
 }
 
@@ -188,18 +200,23 @@ func TestBusinessOutcomesAreAcknowledged(t *testing.T) {
 func TestTransientFailureIsRetried(t *testing.T) {
 	q := newQueues(t)
 	var calls counter
-	consumer(t, q, handlerFunc(func(ctx context.Context, msg app.InboxMessage, in wagering.RequestInput, tr event.Trace) (app.MessageResult, error) {
+	reg := prometheus.NewRegistry()
+	consumerWith(t, q, handlerFunc(func(ctx context.Context, msg app.InboxMessage, in wagering.RequestInput, tr event.Trace) (app.MessageResult, error) {
 		if calls.inc() <= 2 {
 			return app.MessageResult{}, &app.TransientError{Err: errors.New("database unavailable")}
 		}
 		return svc.HandleMessage(ctx, msg, in, tr)
-	}))
+	}), metrics.New(reg))
 	w := openWallet(t, "100.00")
 	send(t, q, w.id, envelope("msg-transient", w, "tr-1", "BET", "10.00", ""))
 
 	eventually(t, 20*time.Second, "processed after retries", func() bool { return balance(t, w) == "90.00" })
 	if calls.n.Load() < 3 || queueDepth(t, q.dlqURL) != 0 {
 		t.Fatalf("calls %d, dead letters %d", calls.n.Load(), queueDepth(t, q.dlqURL))
+	}
+	retries := map[string]string{"component": "sqs_consumer", "reason": "transient"}
+	if got := metricstest.Value(t, reg, "wallet_retries_total", retries); got != 2 {
+		t.Errorf("consumer retries = %v, want 2", got)
 	}
 }
 

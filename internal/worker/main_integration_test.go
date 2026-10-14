@@ -76,8 +76,8 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
-	e := &env{db: db, uow: postgres.NewUnitOfWork(db.App, 5*time.Second)}
-	e.svc = app.NewService(e.uow, app.SystemClock{}, app.RetryPolicy{Retries: 3, BaseDelay: 10 * time.Millisecond}, fastReference, quiet)
+	e := &env{db: db, uow: postgres.NewUnitOfWork(db.App, 5*time.Second, app.NopMetrics{})}
+	e.svc = app.NewService(e.uow, app.SystemClock{}, app.RetryPolicy{Retries: 3, BaseDelay: 10 * time.Millisecond}, fastReference, app.NopMetrics{}, quiet)
 
 	s := suffix()
 	topic, err := snsClient.CreateTopic(ctx, &awssns.CreateTopicInput{Name: aws.String("events-" + s + ".fifo"),
@@ -185,10 +185,15 @@ func (e *env) recorder() *recorder {
 }
 
 func (e *env) relay(owner string, pub app.EventPublisher, lease time.Duration) *app.OutboxRelay {
+	return e.relayWith(owner, pub, lease, app.NopMetrics{})
+}
+
+// relayWith é o relay com as métricas informadas.
+func (e *env) relayWith(owner string, pub app.EventPublisher, lease time.Duration, m app.Metrics) *app.OutboxRelay {
 	return app.NewOutboxRelay(e.uow, pub, app.SystemClock{}, app.OutboxRelayConfig{
 		Owner: owner, BatchSize: 50, Lease: lease, Concurrency: 8,
 		RetryBase: 100 * time.Millisecond, RetryMax: 400 * time.Millisecond,
-	}, quiet)
+	}, m, quiet)
 }
 
 // drain publica até não sobrar evento pendente (ou o prazo acabar).

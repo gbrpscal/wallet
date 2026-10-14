@@ -30,6 +30,7 @@ type OutboxRelay struct {
 	publisher EventPublisher
 	clock     Clock
 	cfg       OutboxRelayConfig
+	metrics   Metrics
 	log       *slog.Logger
 
 	afterClaim   func([]OutboxEvent) error
@@ -37,8 +38,8 @@ type OutboxRelay struct {
 }
 
 // NewOutboxRelay cria o relay.
-func NewOutboxRelay(uow UnitOfWork, publisher EventPublisher, clock Clock, cfg OutboxRelayConfig, log *slog.Logger) *OutboxRelay {
-	return &OutboxRelay{uow: uow, publisher: publisher, clock: clock, cfg: cfg,
+func NewOutboxRelay(uow UnitOfWork, publisher EventPublisher, clock Clock, cfg OutboxRelayConfig, metrics Metrics, log *slog.Logger) *OutboxRelay {
+	return &OutboxRelay{uow: uow, publisher: publisher, clock: clock, cfg: cfg, metrics: metrics,
 		log: log.With("component", "outbox-relay", "owner", cfg.Owner)}
 }
 
@@ -118,6 +119,7 @@ func (r *OutboxRelay) RunOnce(ctx context.Context, stopping <-chan struct{}) (in
 func (r *OutboxRelay) publishOne(ctx context.Context, e OutboxEvent) bool {
 	log := r.log.With("eventId", e.ID.String(), "eventType", e.EventType, "aggregateId", e.AggregateID)
 	if err := r.publisher.Publish(ctx, e); err != nil {
+		r.metrics.Retry(RetryComponentPublisher, RetryReasonBrokerError)
 		attempt := e.Attempts + 1
 		next := r.clock.Now().Add(r.backoff(attempt))
 		msg := err.Error()
@@ -152,6 +154,7 @@ func (r *OutboxRelay) publishOne(ctx context.Context, e OutboxEvent) bool {
 		log.Warn("event published after the lease was taken over; duplicates share the eventId")
 		return false
 	}
+	r.metrics.OutboxPublished(r.clock.Now().Sub(e.OccurredAt))
 	log.Debug("event published")
 	return true
 }

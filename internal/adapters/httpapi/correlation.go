@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gbrpscal/wallet/internal/domain"
+	"github.com/gbrpscal/wallet/internal/platform/logctx"
 )
 
 // CorrelationHeader carrega o id de correlação entre o cliente e o serviço.
@@ -28,7 +29,9 @@ func withCorrelation(next http.Handler) http.Handler {
 			}
 		}
 		w.Header().Set(CorrelationHeader, id)
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), correlationKey{}, id)))
+		ctx := context.WithValue(r.Context(), correlationKey{}, id)
+		ctx = logctx.With(ctx, logctx.CorrelationID, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

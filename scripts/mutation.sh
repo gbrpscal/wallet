@@ -153,6 +153,21 @@ mutate "hash inclui a idempotency key" internal/domain/wagering/request.go \
 mutate "hash com escape de HTML" internal/domain/wagering/request.go \
   'enc.SetEscapeHTML(false)' 'enc.SetEscapeHTML(true)'
 
+# --- Observabilidade: logs com contexto e métricas (testes unitários) ----------
+PL=./internal/platform/...
+baseline $PL
+
+mutate "log com chave repetida não substitui o valor" internal/platform/logctx/logctx.go \
+  'if !replaced[a.Key] {' 'if true {' $PL
+mutate "atributos do filho alteram o contexto do pai" internal/platform/logctx/logctx.go \
+  'attrs := make([]slog.Attr, 0, len(current)+len(args)/2)' 'attrs := current[:0]' $PL
+mutate "handler ignora os atributos do contexto" internal/platform/logctx/logctx.go \
+  'r.AddAttrs(attrs...)' '_ = attrs' $PL
+mutate "reconciliação divergente contada como consistente" internal/platform/metrics/metrics.go \
+  'result = "divergent"' 'result = "consistent"' $PL
+mutate "backlog grava a idade no lugar da contagem" internal/platform/metrics/metrics.go \
+  'p.outboxPending.Set(float64(pending))' 'p.outboxPending.Set(oldest.Seconds())' $PL
+
 # --- Persistência (tag integration; exige o PostgreSQL no ar) --------------------
 PG=./internal/adapters/postgres/...
 baseline $PG integration
@@ -196,6 +211,13 @@ mutate "lock_timeout não aplicado" internal/adapters/postgres/uow.go \
 mutate "busca de replay sem escopo de provedor" internal/adapters/postgres/transactions.go \
   'WHERE provider_id = $1 AND idempotency_key = $2' 'WHERE $1::text IS NOT NULL AND idempotency_key = $2' $PG integration
 
+mutate "lock timeout sem classificação de conflito" internal/adapters/postgres/errors.go \
+  'Conflict: conflictKinds[pgErr.Code]}' 'Conflict: ""}' $PG integration
+mutate "versão desatualizada não conta conflito" internal/adapters/postgres/uow.go \
+  'u.metrics.ConcurrencyConflict(app.ConflictStaleVersion)' '_ = app.ConflictStaleVersion' $PG integration
+mutate "violação de unicidade não conta conflito" internal/adapters/postgres/uow.go \
+  'u.metrics.ConcurrencyConflict(app.ConflictUnique)' '_ = app.ConflictUnique' $PG integration
+
 # --- Casos de uso (tag integration; exige o PostgreSQL no ar) --------------------
 APP=./internal/app/...
 baseline $APP integration
@@ -227,6 +249,32 @@ mutate "retry não repete falha transitória" internal/app/policy.go \
 mutate "cursor aceita versão negativa" internal/app/policy.go \
   '|| c.V != 1 || c.After < 0 {' '|| c.V != 1 {' $APP
 
+mutate "replay contado como operação" internal/app/instrument.go \
+  'case res.Replay:' 'case false && res.Replay:' $APP integration
+mutate "erro contado como operação rejeitada" internal/app/instrument.go \
+  's.metrics.OperationDuration(ch, label, errorCode(err), d)' 's.metrics.OperationCompleted(ch, label, "REJECTED", errorCode(err))' $APP integration
+mutate "reentrega da inbox contada como replay" internal/app/instrument.go \
+  's.metrics.Duplicate(ChannelSQS, DuplicateInboxRedelivery)' 's.metrics.Duplicate(ChannelSQS, DuplicateIdempotentReplay)' $APP integration
+mutate "kind inválido vira label livre" internal/app/instrument.go \
+  'return kindUnknown' 'return kind' $APP integration
+mutate "retry do caso de uso não contado" internal/app/instrument.go \
+  's.metrics.Retry(RetryComponentUseCase, retryReason(last))' '_ = retryReason(last)' $APP integration
+mutate "retry sempre atribuído a falha transitória" internal/app/instrument.go \
+  'case errors.Is(err, ErrConcurrentUpdate):
+		return RetryReasonStaleVersion' 'case errors.Is(err, ErrConcurrentUpdate):
+		return RetryReasonTransient' $APP integration
+mutate "tentativa em espera do worker não contada" internal/app/service.go \
+  'case status == ResolveWaiting:
+		s.metrics.PendingReferenceAttempt(string(status))' 'case status == ResolveWaiting:' $APP integration
+mutate "expiração não conta a operação do worker" internal/app/service.go \
+  's.metrics.OperationCompleted(ChannelWorker, string(t.Kind()), string(t.Status()), string(t.FailureCode()))' '' $APP integration
+mutate "reconciliação sempre contada como consistente" internal/app/service.go \
+  's.metrics.Reconciliation(r.Consistent)' 's.metrics.Reconciliation(true)' $APP integration
+mutate "log de expiração carrega o valor" internal/app/service.go \
+  '"pending reference expired", "attempts", next.Attempts)' '"pending reference expired", "attempts", next.Attempts, "amount", t.Money().Amount())' $APP integration
+mutate "worker sem transactionId no contexto de log" internal/app/service.go \
+  'ctx = logctx.With(ctx, logctx.TransactionID, id.String())' '_ = logctx.TransactionID' $APP integration
+
 # --- HTTP e autenticação (tag integration; exige PostgreSQL e Keycloak no ar) ---------
 API=./internal/adapters/httpapi/...
 baseline $API integration
@@ -256,6 +304,17 @@ mutate "Idempotency-Key opcional" internal/adapters/httpapi/handlers.go \
   'if key == "" {' 'if false {' $API integration
 mutate "X-Correlation-Id do cliente ignorado" internal/adapters/httpapi/correlation.go \
   'if domain.ValidateTextID("correlationId", id) != nil {' 'if true {' $API integration
+
+mutate "access log com a URL no lugar da rota" internal/adapters/httpapi/accesslog.go \
+  'info.route = r.Pattern' 'info.route = r.URL.Path' $API integration
+mutate "health check logado em info" internal/adapters/httpapi/accesslog.go \
+  'level = slog.LevelDebug' 'level = slog.LevelInfo' $API integration
+mutate "access log registra o header Authorization" internal/adapters/httpapi/accesslog.go \
+  'attrs := []any{"method", r.Method,' 'attrs := []any{"auth", r.Header.Get("Authorization"), "method", r.Method,' $API integration
+mutate "correlationId fora do contexto de log" internal/adapters/httpapi/correlation.go \
+  'ctx = logctx.With(ctx, logctx.CorrelationID, id)' '_ = logctx.CorrelationID' $API integration
+mutate "access log sem a identidade autenticada" internal/adapters/httpapi/auth.go \
+  'info.clientID, info.providerID = p.ClientID, p.ProviderID' '_ = info' $API integration
 
 # --- Consumidor SQS e inbox (tag integration; exige PostgreSQL e LocalStack no ar) ---
 MQ=./internal/adapters/sqs/...
@@ -289,6 +348,11 @@ mutate "envelope aceita campos desconhecidos" internal/adapters/sqs/message.go \
   'dec := json.NewDecoder(bytes.NewReader([]byte(body)))
 	dec.DisallowUnknownFields()' 'dec := json.NewDecoder(bytes.NewReader([]byte(body)))' $MQ
 
+mutate "DLQ sem métrica por código" internal/adapters/sqs/consumer.go \
+  'c.metrics.DeadLetter(c.cfg.DLQName, code)' 'c.metrics.DeadLetter(c.cfg.DLQName, "")' $MQ integration
+mutate "retry do consumidor não contado" internal/adapters/sqs/consumer.go \
+  'c.metrics.Retry(app.RetryComponentConsumer, app.RetryReasonTransient)' '_ = app.RetryComponentConsumer' $MQ integration
+
 # --- Outbox e workers (tag integration; exige PostgreSQL e LocalStack no ar) ------
 WK=./internal/worker/...
 baseline $WK integration
@@ -315,6 +379,21 @@ mutate "republicação com outro id de deduplicação" internal/adapters/sns/sns
   'MessageDeduplicationId: aws.String(e.ID.String()),' 'MessageDeduplicationId: aws.String(e.ID.String() + fmt.Sprintf("%p", &e)),' $WK integration
 mutate "grupo do broker diferente do agregado" internal/adapters/sns/sns.go \
   'MessageGroupId:         aws.String(e.AggregateID),' 'MessageGroupId:         aws.String("all"),' $WK integration
+
+mutate "falha do broker sem métrica de retry" internal/app/outbox.go \
+  'r.metrics.Retry(RetryComponentPublisher, RetryReasonBrokerError)' '_ = RetryReasonBrokerError' $WK integration
+mutate "atraso de publicação não medido" internal/app/outbox.go \
+  'r.metrics.OutboxPublished(r.clock.Now().Sub(e.OccurredAt))' '_ = e.OccurredAt' $WK integration
+mutate "backlog conta eventos já publicados" internal/adapters/postgres/messaging.go \
+  'SELECT count(*), min(occurred_at) FROM outbox_events WHERE published_at IS NULL' 'SELECT count(*), min(occurred_at) FROM outbox_events' $WK integration
+mutate "fila de DLQ inexistente interrompe as demais" internal/worker/worker.go \
+  '				log.Warn("reading dead-letter queue depth failed", "queue", name, "error", err)
+				continue' '				log.Warn("reading dead-letter queue depth failed", "queue", name, "error", err)
+				return false' $WK integration
+mutate "componente duplicado no log do refresher" internal/worker/worker.go \
+  'base := log
+	log = log.With("component", "gauge-refresher")' 'base := log.With("component", "gauge-refresher")
+	log = log.With("component", "gauge-refresher")' $WK integration
 
 echo
 echo "mutantes mortos: $killed, problemas: $bad"

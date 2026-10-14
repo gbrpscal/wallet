@@ -15,6 +15,7 @@ As decisões técnicas estão em [ARCHITECTURE.md](ARCHITECTURE.md).
 - [Filas SQS](#filas-sqs)
 - [Banco de dados e migrations](#banco-de-dados-e-migrations)
 - [Exemplos de chamadas](#exemplos-de-chamadas)
+- [Observabilidade](#observabilidade)
 - [Testes](#testes)
 - [Testes de integração, múltiplas instâncias e falha](#testes-de-integração-múltiplas-instâncias-e-falha)
 - [Estrutura do repositório](#estrutura-do-repositório)
@@ -68,6 +69,7 @@ docker compose down
 | Serviço | Endereço no host | Endereço na rede do Compose |
 |---|---|---|
 | API | `http://localhost:8080` | `http://app:8080` |
+| Métricas (Prometheus) | não publicado | `http://app:9090/metrics` |
 | Keycloak | `http://localhost:8180` | `http://keycloak:8080` |
 | PostgreSQL | não publicado | `postgres:5432` |
 | LocalStack (SQS) | não publicado | `http://localstack:4566` |
@@ -118,6 +120,10 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 | `REFERENCE_WORKER_INTERVAL` / `REFERENCE_WORKER_BATCH` | `1s` / `50` | Ciclo e lote do worker |
 | `REFERENCE_WORKER_CONCURRENCY` | `8` | Carteiras resolvidas em paralelo |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
+| `METRICS_ENABLED` | `true` | Liga as métricas Prometheus e o servidor de métricas |
+| `METRICS_ADDR` | `:9090` | Endereço do servidor de métricas (`GET /metrics`), separado da API |
+| `METRICS_REFRESH_INTERVAL` | `15s` | Ciclo de leitura dos gauges de backlog da outbox e de profundidade das DLQs |
+| `SQS_EVENTS_DLQ_NAME` | `wallet-events-audit-dlq.fifo` | DLQ da assinatura dos eventos, monitorada junto com `SQS_WAGER_DLQ_NAME` |
 | `SHUTDOWN_TIMEOUT` | `30s` | Prazo para concluir o trabalho em andamento no encerramento |
 | `READINESS_TIMEOUT` | `2s` | Timeout de cada checagem de readiness |
 | `HTTP_READ_TIMEOUT` / `HTTP_WRITE_TIMEOUT` / `HTTP_READ_HEADER_TIMEOUT` | `10s` / `15s` / `5s` | Timeouts do servidor HTTP |
@@ -333,6 +339,55 @@ curl -s $API/providers/provider-a/wagering/transactions/transaction-123 -H "Auth
 
 Os erros seguem a RFC 9457 (`application/problem+json`), com `code` estável e `correlationId`. Envie `X-Correlation-Id` para correlacionar com os seus sistemas; se não enviar, o serviço gera um id e o devolve no mesmo header. O catálogo completo de códigos está em [ARCHITECTURE.md](ARCHITECTURE.md) (§4.9 e §4.13).
 
+## Observabilidade
+
+### Logs
+
+Uma linha JSON por evento, em `stdout`. Os ids da requisição ou da mensagem entram em todas as linhas do fluxo, sem precisar repassá-los a cada chamada:
+
+| Atributo | Quando aparece |
+|---|---|
+| `correlationId` | requisições HTTP (do header `X-Correlation-Id` ou gerado) e eventos de pendências |
+| `clientId`, `providerId` | depois da autenticação; `providerId` também nas operações recebidas por SQS |
+| `walletId` | operações, pendências e reconciliação |
+| `messageId` | mensagens do consumidor SQS |
+| `transactionId` | tentativas do worker de referências |
+
+Cada requisição HTTP gera uma linha `"http request"` com `method`, `route` (o padrão da rota, como `GET /wallets/{walletId}`, nunca a URL com ids), `status` e `durationMs`. Os health checks saem em `debug`, para não poluir o log; o resto, em `info`. Rotas inexistentes aparecem como `route: "unmatched"`.
+
+Os logs **nunca** trazem tokens, o header `Authorization`, segredos ou valores monetários. A única exceção é a divergência de reconciliação, que registra os valores armazenado e calculado em `error`, porque são o próprio diagnóstico.
+
+Exemplo:
+
+```json
+{"time":"2026-10-14T12:01:15.027Z","level":"INFO","msg":"http request","method":"POST","route":"POST /wallets","status":201,"durationMs":176,"clientId":"wallet-backoffice","correlationId":"01a13a49-c262-7e22-906b-b2cb94c2d488"}
+```
+
+### Métricas
+
+As métricas ficam em `GET /metrics`, na porta `9090`, que **não é publicada no host**: só a rede interna do Compose as alcança. Para ler com a stack no ar:
+
+```bash
+docker compose run --rm tools curl -s http://app:9090/metrics
+```
+
+| Métrica | Tipo | Labels | O que mede |
+|---|---|---|---|
+| `wallet_operations_total` | counter | `channel`, `kind`, `status`, `failure_code` | operações concluídas de fato (replays não contam) |
+| `wallet_operation_duration_seconds` | histograma | `channel`, `kind`, `outcome` | duração do caso de uso; `outcome` é o status ou o código do erro |
+| `wallet_duplicates_total` | counter | `channel`, `reason` | `idempotent_replay` (mesma chave) e `inbox_redelivery` (mesma mensagem) |
+| `wallet_retries_total` | counter | `component`, `reason` | novas tentativas do caso de uso, do consumidor e do publisher |
+| `wallet_dead_letters_total` | counter | `queue`, `error_code` | mensagens enviadas à DLQ pelo consumidor |
+| `wallet_dead_letter_queue_messages` | gauge | `queue` | mensagens nas DLQs de entrada e de eventos |
+| `wallet_concurrency_conflicts_total` | counter | `kind` | `stale_version`, `lock_timeout`, `deadlock`, `serialization`, `unique` |
+| `wallet_outbox_publish_delay_seconds` | histograma | — | tempo entre o evento e a sua publicação |
+| `wallet_outbox_pending_events` | gauge | — | eventos ainda não publicados |
+| `wallet_outbox_oldest_pending_age_seconds` | gauge | — | idade do evento pendente mais antigo |
+| `wallet_reconciliations_total` | counter | `result` | `consistent` ou `divergent` |
+| `wallet_pending_reference_attempts_total` | counter | `result` | tentativas do worker: `waiting`, `completed`, `expired` |
+
+`channel` é `http`, `sqs` ou `worker`. Também são expostas as métricas padrão do runtime Go (`go_*`) e do processo (`process_*`). Nenhuma métrica carrega valor monetário (as métricas Prometheus são `float64`), nem ids de carteira ou de provedor, que gerariam cardinalidade sem limite.
+
 ## Testes
 
 Os testes unitários não precisam de nenhuma dependência no ar:
@@ -350,6 +405,8 @@ docker compose run --rm tools go test -race ./...
 | `internal/domain` | erros tipados, IDs, ausência de ponto flutuante, isolamento do domínio |
 | `internal/app` | política de espera (backoff, teto, expiração), retry de falhas transitórias, cursor do ledger |
 | `internal/adapters/httpapi` | header `Authorization`, JSON estrito, Money só como string, mapeamento de erros para HTTP, recuperação de panic |
+| `internal/platform/logctx` | atributos do contexto em todas as linhas, substituição de chave repetida, contexto pai preservado |
+| `internal/platform/metrics` | cada método da porta alimenta a métrica e os labels do catálogo |
 
 ### Testes de integração (persistência, casos de uso, API, SQS e workers)
 
@@ -381,6 +438,8 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestUnitOfWorkRollsBackEverything` | atomicidade: nada é gravado se a transação falha |
 | `TestOutboxSnapshotIsImmutable`, `TestInboxDeduplicates` | snapshot imutável da outbox; deduplicação da inbox |
 
+Os testes `TestSaveDetectsStaleVersion`, `TestLockTimeoutIsTransient` e `TestIdempotencyConstraints` também conferem a métrica de conflito de cada caso (`stale_version`, `lock_timeout` e `unique`).
+
 **Casos de uso** (`internal/app`, com relógio controlado)
 
 | Teste | O que comprova |
@@ -399,6 +458,10 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestRefundAndRollbackOfTheSameBet`, `TestRollbackOfWinWithoutFunds` | devolução única por aposta; reversão sem saldo com código próprio |
 | `TestReconciliation` | reconciliação consistente e detecção de divergência (log e resposta) sem alterar o saldo |
 | `TestLedgerPagination`, `TestTransactionLookupsAreProviderScoped`, `TestSameKeyFromAnotherProviderIsIndependent` | cursor opaco e limites; consultas e replays isolados por provedor |
+| `TestMetricsFiftyIdenticalBets` | 50 apostas iguais em paralelo: 1 operação, 49 duplicatas e 50 amostras de latência |
+| `TestMetricsRejectionAndErrors`, `TestMetricsMessageChannel` | rejeição conta com o código; erro de validação só no histograma; reentrega da inbox e replay contados à parte |
+| `TestMetricsPendingReferenceExpiration`, `TestMetricsReconciliation`, `TestMetricsUseCaseRetries` | tentativas e expiração do worker; resultado da reconciliação; cada retry pelo motivo da falha anterior |
+| `TestLogsCarryIdsButNoMoney` | os fluxos principais registram ids pelo contexto e nenhum valor monetário |
 
 **API** (`internal/adapters/httpapi`, com o Keycloak real e tokens `client_credentials` de verdade)
 
@@ -410,6 +473,8 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestProviderIsolation` | provedor não opera, não faz replay e não consulta em nome de outro; o `404` não vaza dados |
 | `TestOperationResponses`, `TestInputAndConflictErrors` | `422` com o corpo da rejeição, `202` com `Location`, `400`, `404`, `409` e `415`; erros corrigíveis não consomem a chave |
 | `TestWalletRules`, `TestCorrelationID` | abertura com zero, carteira duplicada, `X-Correlation-Id` propagado até a outbox |
+| `TestAccessLog` | uma linha por requisição com o padrão da rota, status, identidade e `correlationId`; health em `debug`; rota inexistente como `unmatched` |
+| `TestLogsCarryNoCredentialsOrMoney` | nenhuma linha de log traz token, `Authorization`, segredo ou valor, inclusive em falhas |
 
 **Consumidor SQS** (`internal/adapters/sqs`, com LocalStack real; cada teste cria o seu par de filas com redrive)
 
@@ -418,9 +483,9 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestConsumesOperation` | mensagem do enunciado processada, inbox concluída, eventos com o `messageId` como correlationId |
 | `TestRedeliveredMessageIsNotReprocessed`, `TestDifferentMessagesSameKey` | reentrega do mesmo envelope e mensagens diferentes com a mesma chave geram um único débito (deduplicação da aplicação, sem depender do SQS) |
 | `TestHTTPAndSQSShareIdempotency` | a mesma operação por HTTP e por SQS, nas duas ordens, gera um único débito |
-| `TestInvalidMessagesGoToDeadLetterQueue`, `TestMessageHashMismatchGoesToDeadLetterQueue` | 8 tipos de mensagem inválida e `messageId` reutilizado vão à DLQ com o `ErrorCode` certo, sem efeito financeiro |
+| `TestInvalidMessagesGoToDeadLetterQueue`, `TestMessageHashMismatchGoesToDeadLetterQueue` | 8 tipos de mensagem inválida e `messageId` reutilizado vão à DLQ com o `ErrorCode` certo (e a métrica por código), sem efeito financeiro |
 | `TestBusinessOutcomesAreAcknowledged` | rejeição e espera por referência são confirmadas e removidas, sem DLQ |
-| `TestTransientFailureIsRetried`, `TestExhaustedRetriesGoToDeadLetterQueue` | falha temporária volta com backoff; após 5 recebimentos, o redrive move para a DLQ |
+| `TestTransientFailureIsRetried`, `TestExhaustedRetriesGoToDeadLetterQueue` | falha temporária volta com backoff (e conta como retry); após 5 recebimentos, o redrive move para a DLQ |
 | `TestCrashAfterCommitBeforeDelete` | queda entre o commit e a remoção: a reentrega é reconhecida pela inbox e não reprocessa |
 | `TestOrderWithinWallet`, `TestHeartbeatKeepsMessageInvisible` | ordem por carteira; processamento longo não deixa a mensagem reaparecer |
 | `TestGracefulShutdown`, `TestStopDeadlineCancelsInFlight` | SIGTERM conclui a mensagem em andamento e devolve as não iniciadas; prazo estourado cancela sem gravar nada |
@@ -431,7 +496,8 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 |---|---|
 | `TestEventsArePublishedAsCommitted`, `TestNothingIsPublishedBeforeCommit` | eventos chegam idênticos ao gravado, com grupo, tipo e versão; nada sai antes do commit |
 | `TestOrderPerAggregate` | eventos de uma carteira saem na ordem de `walletVersion`, mesmo com falha e republicação no meio |
-| `TestBrokerUnavailableIsRetriedWithBackoff` | falha no broker registra tentativa e erro, respeita o backoff e não perde evento |
+| `TestBrokerUnavailableIsRetriedWithBackoff` | falha no broker registra tentativa e erro, respeita o backoff e não perde evento; retries e atraso de publicação medidos |
+| `TestGaugeLoopReportsBacklogAndDeadLetters` | gauges de backlog da outbox e de profundidade da DLQ; uma fila inexistente não interrompe as demais |
 | `TestTwoPublishersCompete` | dois publishers na mesma outbox: cada evento publicado uma única vez |
 | `TestAbandonedClaimIsRecovered`, `TestLeaseIsRenewedDuringSlowPublish` | reserva abandonada é assumida após o lease; reserva de um publisher vivo não é tomada |
 | `TestRepublishAfterCrashKeepsEventID` | queda entre publicar e marcar: republicação com o mesmo `eventId` e os mesmos bytes, uma única cópia entregue |
@@ -441,7 +507,7 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 
 ### Testes de mutação
 
-O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado", "audiência não conferida" e "reserva ignora a ordem por agregado". Os mutantes de persistência, de casos de uso, de API, do consumidor e dos workers exigem PostgreSQL, Keycloak e LocalStack no ar:
+O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado", "audiência não conferida", "reserva ignora a ordem por agregado" e "access log registra o header Authorization". Os mutantes de persistência, de casos de uso, de API, do consumidor e dos workers exigem PostgreSQL, Keycloak e LocalStack no ar:
 
 ```bash
 docker compose up -d --wait postgres keycloak localstack
@@ -472,7 +538,7 @@ cmd/wallet/            ponto de entrada (composição Fx)
 internal/domain/       modelo de domínio puro
 internal/app/          casos de uso, portas (UnitOfWork, repositórios) e erros
 internal/adapters/     PostgreSQL, HTTP, SQS
-internal/platform/     configuração, logs, health
+internal/platform/     configuração, logs (com atributos de contexto), health, métricas
 deploy/                PostgreSQL (papéis), Keycloak, LocalStack, Toxiproxy
 migrations/            schema, constraints e triggers (goose)
 scripts/               testes de mutação

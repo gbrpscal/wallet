@@ -73,12 +73,12 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 		}
 	}
 	if app.IsRetryable(err) || errors.Is(err, app.ErrDuplicate) || errors.Is(err, context.DeadlineExceeded) {
-		a.log.WarnContext(r.Context(), "transient failure", "correlationId", correlationFrom(r.Context()), "error", err)
+		a.log.WarnContext(r.Context(), "transient failure", "error", err)
 		w.Header().Set("Retry-After", "1")
 		a.problem(w, r, http.StatusServiceUnavailable, CodeUnavailable, "temporarily unavailable, retry later")
 		return
 	}
-	a.log.ErrorContext(r.Context(), "request failed", "correlationId", correlationFrom(r.Context()), "error", err)
+	a.log.ErrorContext(r.Context(), "request failed", "error", err)
 	code := CodeInternal
 	if de != nil {
 		code = de.Code
@@ -131,7 +131,7 @@ func recoverer(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
-				log.ErrorContext(r.Context(), "panic in handler", "correlationId", correlationFrom(r.Context()), "panic", v)
+				log.ErrorContext(r.Context(), "panic in handler", "panic", v)
 				w.Header().Set("Content-Type", "application/problem+json")
 				w.WriteHeader(http.StatusInternalServerError)
 				_ = json.NewEncoder(w).Encode(problemDoc{Type: "urn:wallet:error:" + string(CodeInternal),

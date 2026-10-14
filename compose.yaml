@@ -116,6 +116,11 @@ services:
       REFERENCE_TTL: ${REFERENCE_TTL:-10m}
       REFERENCE_BACKOFF_BASE: ${REFERENCE_BACKOFF_BASE:-1s}
       REFERENCE_BACKOFF_MAX: ${REFERENCE_BACKOFF_MAX:-60s}
+      # Métricas Prometheus em porta separada, só na rede interna (não publicada).
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_ADDR: ":9090"
+      METRICS_REFRESH_INTERVAL: ${METRICS_REFRESH_INTERVAL:-15s}
+      SQS_EVENTS_DLQ_NAME: wallet-events-audit-dlq.fifo
     ports:
       - "${APP_HOST_PORT:-8080}:8080"
     depends_on:

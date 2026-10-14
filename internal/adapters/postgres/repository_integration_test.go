@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/gbrpscal/wallet/internal/adapters/postgres"
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/domain"
@@ -17,6 +19,8 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/money"
 	"github.com/gbrpscal/wallet/internal/domain/wagering"
 	"github.com/gbrpscal/wallet/internal/domain/wallet"
+	"github.com/gbrpscal/wallet/internal/platform/metrics"
+	"github.com/gbrpscal/wallet/internal/platform/metrics/metricstest"
 )
 
 func TestOpeningRoundTrip(t *testing.T) {
@@ -128,8 +132,10 @@ func TestIdempotencyConstraints(t *testing.T) {
 	out := openWallet(t, "100.00")
 	mustProcess(t, operation(t, out.Wallet, "provider-a", "idem-1", "BET", "1.00", ""))
 
+	reg := prometheus.NewRegistry()
+	counted := postgres.NewUnitOfWork(appPool, 2*time.Second, metrics.New(reg))
 	insert := func(req wagering.Request) error {
-		return uow().Do(ctx, func(ctx context.Context, tx app.Tx) error {
+		return counted.Do(ctx, func(ctx context.Context, tx app.Tx) error {
 			wtx, err := wagering.NewExternal(req, time.Now())
 			if err != nil {
 				return err
@@ -150,6 +156,9 @@ func TestIdempotencyConstraints(t *testing.T) {
 	})
 	if err := insert(otherKey); !errors.As(err, &dup) || dup.Constraint != "wager_transactions_provider_external_uq" {
 		t.Errorf("same operation with another key: %v", err)
+	}
+	if n := metricstest.Value(t, reg, "wallet_concurrency_conflicts_total", map[string]string{"kind": "unique"}); n != 2 {
+		t.Errorf("unique conflicts = %v, want 2", n)
 	}
 
 	// Outro provedor pode usar a mesma chave e o mesmo id externo.
@@ -235,7 +244,9 @@ func TestUnitOfWorkRollsBackEverything(t *testing.T) {
 func TestSaveDetectsStaleVersion(t *testing.T) {
 	ctx := context.Background()
 	out := openWallet(t, "100.00")
-	err := uow().Do(ctx, func(ctx context.Context, tx app.Tx) error {
+	reg := prometheus.NewRegistry()
+	counted := postgres.NewUnitOfWork(appPool, 2*time.Second, metrics.New(reg))
+	err := counted.Do(ctx, func(ctx context.Context, tx app.Tx) error {
 		w, err := tx.Wallets().Get(ctx, out.Wallet.ID())
 		if err != nil {
 			return err
@@ -248,6 +259,9 @@ func TestSaveDetectsStaleVersion(t *testing.T) {
 	})
 	if !errors.Is(err, app.ErrConcurrentUpdate) || !app.IsRetryable(err) {
 		t.Fatalf("stale save: error = %v, want ErrConcurrentUpdate", err)
+	}
+	if n := metricstest.Value(t, reg, "wallet_concurrency_conflicts_total", map[string]string{"kind": "stale_version"}); n != 1 {
+		t.Errorf("stale_version conflicts = %v, want 1", n)
 	}
 }
 
@@ -401,13 +415,17 @@ func TestLockTimeoutIsTransient(t *testing.T) {
 	<-locked
 	defer func() { close(release); <-done }()
 
-	short := postgres.NewUnitOfWork(appPool, 200*time.Millisecond)
+	reg := prometheus.NewRegistry()
+	short := postgres.NewUnitOfWork(appPool, 200*time.Millisecond, metrics.New(reg))
 	err := short.Do(context.Background(), func(ctx context.Context, tx app.Tx) error {
 		_, err := processNew(ctx, tx, operation(t, a.Wallet, "provider-a", "timeout-bet", "BET", "10.00", ""))
 		return err
 	})
 	if !errors.Is(err, app.ErrTransient) || !app.IsRetryable(err) {
 		t.Fatalf("error = %v, want transient", err)
+	}
+	if n := metricstest.Value(t, reg, "wallet_concurrency_conflicts_total", map[string]string{"kind": "lock_timeout"}); n != 1 {
+		t.Errorf("lock_timeout conflicts = %v, want 1", n)
 	}
 }
 

@@ -50,8 +50,8 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	svc = app.NewService(postgres.NewUnitOfWork(db.App, 5*time.Second), app.SystemClock{},
-		app.RetryPolicy{Retries: 1, BaseDelay: 10 * time.Millisecond}, app.DefaultReferencePolicy, log)
+	svc = app.NewService(postgres.NewUnitOfWork(db.App, 5*time.Second, app.NopMetrics{}), app.SystemClock{},
+		app.RetryPolicy{Retries: 1, BaseDelay: 10 * time.Millisecond}, app.DefaultReferencePolicy, app.NopMetrics{}, log)
 	code := m.Run()
 	db.Close()
 	os.Exit(code)
@@ -110,13 +110,19 @@ func (f handlerFunc) HandleMessage(ctx context.Context, msg app.InboxMessage, in
 // 2s, backoff de 1s a 2s) sobre as filas do teste.
 func consumer(t *testing.T, q queues, h wsqs.MessageHandler) *wsqs.Consumer {
 	t.Helper()
+	return consumerWith(t, q, h, app.NopMetrics{})
+}
+
+// consumerWith é o consumer com as métricas informadas.
+func consumerWith(t *testing.T, q queues, h wsqs.MessageHandler, m app.Metrics) *wsqs.Consumer {
+	t.Helper()
 	if h == nil {
 		h = svc
 	}
 	c := wsqs.NewConsumer(client, h, wsqs.ConsumerConfig{
 		Name: "test-consumer-" + q.name, QueueName: q.name, DLQName: q.dlqName, Pollers: 2,
 		WaitTime: time.Second, Visibility: 2 * time.Second, RetryBase: time.Second, RetryMax: 2 * time.Second,
-	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}, m, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err := c.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}

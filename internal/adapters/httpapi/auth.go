@@ -9,6 +9,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 
 	"github.com/gbrpscal/wallet/internal/platform/config"
+	"github.com/gbrpscal/wallet/internal/platform/logctx"
 )
 
 // Scopes OAuth 2.0 exigidos por operação (D8).
@@ -92,7 +93,7 @@ func principalFrom(ctx context.Context) Principal {
 // com WWW-Authenticate; token válido sem o scope: 403. Em nenhum dos casos o
 // handler roda, então não há efeito financeiro nem exposição de dados.
 func (a *API) requireScope(scope string, next http.HandlerFunc) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return routed(func(w http.ResponseWriter, r *http.Request) {
 		raw, ok := bearerToken(r)
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="wallet"`)
@@ -101,11 +102,19 @@ func (a *API) requireScope(scope string, next http.HandlerFunc) http.Handler {
 		}
 		p, err := a.auth.Authenticate(r.Context(), raw)
 		if err != nil {
-			a.log.InfoContext(r.Context(), "authentication failed", "correlationId", correlationFrom(r.Context()), "error", err)
+			a.log.InfoContext(r.Context(), "authentication failed", "error", err)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="wallet", error="invalid_token"`)
 			a.problem(w, r, http.StatusUnauthorized, CodeUnauthenticated, "invalid or expired token")
 			return
 		}
+		if info := infoFrom(r.Context()); info != nil {
+			info.clientID, info.providerID = p.ClientID, p.ProviderID
+		}
+		ctx := logctx.With(r.Context(), logctx.ClientID, p.ClientID)
+		if p.ProviderID != "" {
+			ctx = logctx.With(ctx, logctx.ProviderID, p.ProviderID)
+		}
+		r = r.WithContext(ctx)
 		if !p.Has(scope) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="wallet", error="insufficient_scope", scope="`+scope+`"`)
 			a.problem(w, r, http.StatusForbidden, CodeForbidden, "token lacks the required scope "+scope)

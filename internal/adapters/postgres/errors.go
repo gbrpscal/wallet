@@ -25,6 +25,13 @@ var transientCodes = map[string]bool{
 	"57P03": true, // cannot_connect_now
 }
 
+// conflictKinds classifica os SQLSTATEs que são conflitos de concorrência.
+var conflictKinds = map[string]string{
+	"40001": app.ConflictSerialization,
+	"40P01": app.ConflictDeadlock,
+	"55P03": app.ConflictLockTimeout,
+}
+
 // constraintErrors traduz constraints de unicidade com significado de negócio.
 var constraintErrors = map[string]*domain.Error{
 	"wallets_player_currency_key": domain.ErrWalletAlreadyExists,
@@ -45,7 +52,7 @@ func translate(err error) error {
 	if errors.As(err, &pgErr) {
 		switch {
 		case transientCodes[pgErr.Code] || strings.HasPrefix(pgErr.Code, "08") || strings.HasPrefix(pgErr.Code, "53"):
-			return &app.TransientError{Err: err}
+			return &app.TransientError{Err: err, Conflict: conflictKinds[pgErr.Code]}
 		case pgErr.Code == "23505":
 			if de, ok := constraintErrors[pgErr.ConstraintName]; ok {
 				return domain.Errorf(de, "%s", pgErr.Detail)

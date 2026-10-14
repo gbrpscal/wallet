@@ -20,7 +20,7 @@ import (
 var trace = event.Trace{CorrelationID: "integration-test"}
 
 func uow() *postgres.UnitOfWork {
-	return postgres.NewUnitOfWork(appPool, 2*time.Second)
+	return postgres.NewUnitOfWork(appPool, 2*time.Second, app.NopMetrics{})
 }
 
 func brl(t *testing.T, amount string) money.Money {

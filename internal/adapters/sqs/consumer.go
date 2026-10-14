@@ -48,6 +48,7 @@ type Consumer struct {
 	client  *sqs.Client
 	handler MessageHandler
 	cfg     ConsumerConfig
+	metrics app.Metrics
 	log     *slog.Logger
 
 	queueURL string
@@ -65,8 +66,8 @@ type Consumer struct {
 }
 
 // NewConsumer cria o consumidor; Start inicia a leitura.
-func NewConsumer(client *sqs.Client, handler MessageHandler, cfg ConsumerConfig, log *slog.Logger) *Consumer {
-	return &Consumer{client: client, handler: handler, cfg: cfg, log: log.With("component", "sqs-consumer", "consumer", cfg.Name)}
+func NewConsumer(client *sqs.Client, handler MessageHandler, cfg ConsumerConfig, metrics app.Metrics, log *slog.Logger) *Consumer {
+	return &Consumer{client: client, handler: handler, cfg: cfg, metrics: metrics, log: log.With("component", "sqs-consumer", "consumer", cfg.Name)}
 }
 
 // SetAfterHandle instala um gancho entre o commit e a remoção da mensagem.
@@ -217,6 +218,7 @@ func (c *Consumer) process(m types.Message) (delay time.Duration, retry bool) {
 			return c.deadLetter(log, m, err)
 		}
 		d := c.backoff(receives)
+		c.metrics.Retry(app.RetryComponentConsumer, app.RetryReasonTransient)
 		log.Warn("transient failure, message will be retried", "retryIn", d.String(), "error", err)
 		return d, true
 	}
@@ -284,6 +286,7 @@ func (c *Consumer) deadLetter(log *slog.Logger, m types.Message, cause error) (t
 		log.Error("dead-letter send failed, message will be retried", "error", err)
 		return c.backoff(1), true
 	}
+	c.metrics.DeadLetter(c.cfg.DLQName, code)
 	log.Warn("message sent to dead-letter queue", "errorCode", code, "error", cause)
 	c.delete(log, m)
 	return 0, false

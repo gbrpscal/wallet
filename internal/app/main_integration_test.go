@@ -20,6 +20,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/domain/event"
 	"github.com/gbrpscal/wallet/internal/domain/money"
 	"github.com/gbrpscal/wallet/internal/domain/wagering"
+	"github.com/gbrpscal/wallet/internal/platform/logctx"
 	"github.com/gbrpscal/wallet/internal/testutil/pgtest"
 )
 
@@ -86,11 +87,17 @@ func (b *syncBuffer) String() string {
 }
 
 func newHarness() *harness {
+	return newHarnessWith(app.NopMetrics{})
+}
+
+// newHarnessWith usa as métricas informadas no serviço e na unidade de
+// trabalho; os logs passam pelo mesmo handler de contexto da aplicação.
+func newHarnessWith(m app.Metrics) *harness {
 	clock := &fakeClock{now: time.Now().UTC()}
 	logs := &syncBuffer{}
-	log := slog.New(slog.NewJSONHandler(logs, nil))
-	svc := app.NewService(postgres.NewUnitOfWork(appPool, 5*time.Second), clock,
-		app.RetryPolicy{Retries: 5, BaseDelay: 5 * time.Millisecond}, testPolicy, log)
+	log := slog.New(logctx.Handler{Handler: slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})})
+	svc := app.NewService(postgres.NewUnitOfWork(appPool, 5*time.Second, m), clock,
+		app.RetryPolicy{Retries: 5, BaseDelay: 5 * time.Millisecond}, testPolicy, m, log)
 	return &harness{svc: svc, clock: clock, logs: logs}
 }
 

@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/gbrpscal/wallet/internal/domain"
 	"github.com/gbrpscal/wallet/internal/domain/event"
 	"github.com/gbrpscal/wallet/internal/domain/money"
 	"github.com/gbrpscal/wallet/internal/domain/wagering"
 	"github.com/gbrpscal/wallet/internal/domain/wallet"
+	"github.com/gbrpscal/wallet/internal/platform/logctx"
 )
 
 // Service reúne os casos de uso. HTTP e SQS chamam os mesmos métodos, então as
@@ -19,12 +21,13 @@ type Service struct {
 	clock     Clock
 	retry     RetryPolicy
 	reference ReferencePolicy
+	metrics   Metrics
 	log       *slog.Logger
 }
 
 // NewService constrói o serviço.
-func NewService(uow UnitOfWork, clock Clock, retry RetryPolicy, reference ReferencePolicy, log *slog.Logger) *Service {
-	return &Service{uow: uow, clock: clock, retry: retry, reference: reference, log: log}
+func NewService(uow UnitOfWork, clock Clock, retry RetryPolicy, reference ReferencePolicy, metrics Metrics, log *slog.Logger) *Service {
+	return &Service{uow: uow, clock: clock, retry: retry, reference: reference, metrics: metrics, log: log}
 }
 
 // OpenWalletInput é a abertura de carteira vinda de fora.
@@ -76,9 +79,8 @@ const (
 	ResolveSkipped ResolveStatus = "skipped"
 )
 
-// OpenWallet abre uma carteira. Saldo inicial positivo grava, no mesmo commit,
-// a carteira, o OPENING, o lançamento de crédito e os eventos.
-func (s *Service) OpenWallet(ctx context.Context, in OpenWalletInput, trace event.Trace) (*wallet.Wallet, error) {
+// openWallet contém a abertura; OpenWallet a mede.
+func (s *Service) openWallet(ctx context.Context, in OpenWalletInput, trace event.Trace) (*wallet.Wallet, error) {
 	playerID, err := domain.ParseID[domain.PlayerID](in.PlayerID)
 	if err != nil {
 		return nil, domain.Errorf(domain.ErrInvalidRequest, "playerId must be a uuid")
@@ -92,7 +94,7 @@ func (s *Service) OpenWallet(ctx context.Context, in OpenWalletInput, trace even
 	}
 
 	var opened *wallet.Wallet
-	err = s.retry.Do(ctx, func() error {
+	err = s.retryDo(ctx, func() error {
 		out, err := wagering.OpenWallet(playerID, initial, trace, s.clock.Now())
 		if err != nil {
 			return err
@@ -119,10 +121,8 @@ func (s *Service) OpenWallet(ctx context.Context, in OpenWalletInput, trace even
 	return opened, err
 }
 
-// SubmitOperation registra e processa uma operação de provedor (BET, WIN,
-// LOSS, REFUND ou ROLLBACK). A mesma chave com conteúdo equivalente devolve o
-// resultado persistido (Replay); com conteúdo diferente, conflito.
-func (s *Service) SubmitOperation(ctx context.Context, in wagering.RequestInput, trace event.Trace) (OperationResult, error) {
+// submitOperation contém o envio de operação; SubmitOperation o mede.
+func (s *Service) submitOperation(ctx context.Context, in wagering.RequestInput, trace event.Trace) (OperationResult, error) {
 	req, err := wagering.NewRequest(in)
 	if err != nil {
 		return OperationResult{}, err
@@ -132,7 +132,7 @@ func (s *Service) SubmitOperation(ctx context.Context, in wagering.RequestInput,
 	}
 
 	var result OperationResult
-	err = s.retry.Do(ctx, func() error {
+	err = s.retryDo(ctx, func() error {
 		return s.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
 			var err error
 			result, err = s.submit(ctx, tx, req, trace)
@@ -151,15 +151,8 @@ type MessageResult struct {
 	Duplicate bool
 }
 
-// HandleMessage trata uma operação recebida por mensageria. O registro na
-// inbox, a operação (transação, ledger, saldo, eventos) e a conclusão na
-// inbox são confirmados na mesma transação SQL: depois do commit, a mensagem
-// pode ser removida da fila; antes dele, nada ficou gravado.
-//
-// A mesma messageId com conteúdo diferente resulta em MESSAGE_HASH_MISMATCH.
-// Mensagens diferentes com a mesma chave de idempotência seguem as regras de
-// replay de SubmitOperation, inclusive entre HTTP e SQS.
-func (s *Service) HandleMessage(ctx context.Context, msg InboxMessage, in wagering.RequestInput, trace event.Trace) (MessageResult, error) {
+// handleMessage contém o tratamento de mensagem; HandleMessage o mede.
+func (s *Service) handleMessage(ctx context.Context, msg InboxMessage, in wagering.RequestInput, trace event.Trace) (MessageResult, error) {
 	req, err := wagering.NewRequest(in)
 	if err != nil {
 		return MessageResult{}, err
@@ -169,7 +162,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg InboxMessage, in wageri
 	}
 
 	var result MessageResult
-	err = s.retry.Do(ctx, func() error {
+	err = s.retryDo(ctx, func() error {
 		return s.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
 			result = MessageResult{}
 			msg.ReceivedAt = domain.Timestamp(s.clock.Now())
@@ -308,70 +301,91 @@ func (s *Service) DuePendingReferences(ctx context.Context, limit int) ([]Pendin
 // o lock da carteira e da transação serializa as tentativas, e quem chega
 // depois encontra a transação concluída ou ainda não vencida.
 func (s *Service) ResolvePendingReference(ctx context.Context, id domain.TransactionID) (ResolveStatus, error) {
-	var status ResolveStatus
-	err := s.retry.Do(ctx, func() error {
+	ctx = logctx.With(ctx, logctx.TransactionID, id.String())
+	start := time.Now()
+	var (
+		status ResolveStatus
+		t      *wagering.WagerTransaction
+	)
+	err := s.retryDo(ctx, func() error {
 		return s.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
 			var err error
-			status, err = s.resolve(ctx, tx, id)
+			status, t, err = s.resolve(ctx, tx, id)
 			return err
 		})
 	})
+	s.recordResolution(status, t, err, time.Since(start))
 	return status, err
 }
 
-func (s *Service) resolve(ctx context.Context, tx Tx, id domain.TransactionID) (ResolveStatus, error) {
+// recordResolution registra uma tentativa do worker: a tentativa em si, a
+// duração e, quando a pendência termina (concluída ou expirada), a operação.
+func (s *Service) recordResolution(status ResolveStatus, t *wagering.WagerTransaction, err error, d time.Duration) {
+	switch {
+	case err != nil:
+		s.metrics.OperationDuration(ChannelWorker, "unknown", errorCode(err), d)
+	case status == ResolveSkipped || t == nil:
+	case status == ResolveWaiting:
+		s.metrics.PendingReferenceAttempt(string(status))
+		s.metrics.OperationDuration(ChannelWorker, string(t.Kind()), string(t.Status()), d)
+	default:
+		s.metrics.PendingReferenceAttempt(string(status))
+		s.metrics.OperationCompleted(ChannelWorker, string(t.Kind()), string(t.Status()), string(t.FailureCode()))
+		s.metrics.OperationDuration(ChannelWorker, string(t.Kind()), string(t.Status()), d)
+	}
+}
+
+func (s *Service) resolve(ctx context.Context, tx Tx, id domain.TransactionID) (ResolveStatus, *wagering.WagerTransaction, error) {
 	current, err := tx.Transactions().Get(ctx, id)
 	if errors.Is(err, ErrNotFound) {
-		return "", domain.Errorf(domain.ErrTransactionNotFound, "transaction %s not found", id)
+		return "", nil, domain.Errorf(domain.ErrTransactionNotFound, "transaction %s not found", id)
 	}
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if current.Status() != wagering.PendingReference {
-		return ResolveSkipped, nil
+		return ResolveSkipped, nil, nil
 	}
 	// Ordem de locks: carteira primeiro, depois a transação.
 	w, err := tx.Wallets().Lock(ctx, current.WalletID())
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	t, info, err := tx.Transactions().LockPending(ctx, id)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	now := s.clock.Now()
 	if t.Status() != wagering.PendingReference || now.Before(info.Schedule.NextAttemptAt) {
-		return ResolveSkipped, nil
+		return ResolveSkipped, nil, nil
 	}
 
 	ref, err := loadReference(ctx, tx, t.ProviderID(), t.ReferenceExternalTransactionID())
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	expectedVersion := w.Version()
 	out, err := wagering.Process(t, w, ref, info.Trace, now)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	status := ResolveCompleted
 	if out.Waiting {
 		next := s.reference.Next(info.Schedule, now)
 		if !s.reference.Exhausted(next, now) {
-			return ResolveWaiting, tx.Transactions().Save(ctx, t, wagering.PendingReference, &next)
+			return ResolveWaiting, t, tx.Transactions().Save(ctx, t, wagering.PendingReference, &next)
 		}
 		if out, err = wagering.Expire(t, w, info.Trace, now); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		status = ResolveExpired
-		s.log.Info("pending reference expired",
-			"transactionId", t.ID().String(), "walletId", t.WalletID().String(),
-			"providerId", t.ProviderID(), "correlationId", info.Trace.CorrelationID,
-			"attempts", next.Attempts)
+		s.log.InfoContext(logctx.With(ctx, logctx.WalletID, t.WalletID().String(), logctx.ProviderID, t.ProviderID(),
+			logctx.CorrelationID, info.Trace.CorrelationID), "pending reference expired", "attempts", next.Attempts)
 	}
 	if err := tx.Transactions().Save(ctx, out.Transaction, wagering.PendingReference, nil); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return status, persistMovement(ctx, tx, out, w, expectedVersion)
+	return status, out.Transaction, persistMovement(ctx, tx, out, w, expectedVersion)
 }
 
 // GetWallet lê uma carteira.
@@ -485,9 +499,12 @@ func (s *Service) Reconcile(ctx context.Context, id domain.WalletID) (Reconcilia
 	if err != nil {
 		return Reconciliation{}, err
 	}
+	s.metrics.Reconciliation(r.Consistent)
 	if !r.Consistent {
-		s.log.Error("reconciliation divergence",
-			"walletId", id.String(), "stored", r.Stored.Amount(), "calculated", r.Calculated.Amount(),
+		// Única linha de log com valores: o enunciado exige reportar a
+		// divergência nos logs.
+		s.log.ErrorContext(logctx.With(ctx, logctx.WalletID, id.String()), "reconciliation divergence",
+			"stored", r.Stored.Amount(), "calculated", r.Calculated.Amount(),
 			"difference", r.Difference.Amount(), "currency", r.Stored.Currency().String(),
 			"checkedEntries", r.CheckedEntries)
 	}

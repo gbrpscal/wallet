@@ -3,10 +3,13 @@
 package worker_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,10 +17,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awssns "github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/domain"
 	"github.com/gbrpscal/wallet/internal/domain/event"
+	"github.com/gbrpscal/wallet/internal/platform/metrics"
+	"github.com/gbrpscal/wallet/internal/platform/metrics/metricstest"
 	"github.com/gbrpscal/wallet/internal/worker"
 )
 
@@ -177,7 +183,8 @@ func TestBrokerUnavailableIsRetriedWithBackoff(t *testing.T) {
 	e.openWallet(t, "10.00")
 	rec := e.recorder()
 	rec.failFirst = 2
-	relay := e.relay("publisher-1", rec, 30*time.Second)
+	reg := prometheus.NewRegistry()
+	relay := e.relayWith("publisher-1", rec, 30*time.Second, metrics.New(reg))
 
 	if _, err := relay.RunOnce(context.Background(), nil); err != nil {
 		t.Fatal(err)
@@ -193,6 +200,13 @@ func TestBrokerUnavailableIsRetriedWithBackoff(t *testing.T) {
 	drain(t, e, relay, 10*time.Second)
 	if got := received(t, e.queueURL, 2, 10*time.Second); len(got) != 2 {
 		t.Fatalf("received %d events after recovery, want 2", len(got))
+	}
+	retries := map[string]string{"component": "outbox_publisher", "reason": "broker_error"}
+	if got := metricstest.Value(t, reg, "wallet_retries_total", retries); got != 2 {
+		t.Errorf("publisher retries = %v, want 2", got)
+	}
+	if got := metricstest.Value(t, reg, "wallet_outbox_publish_delay_seconds", map[string]string{}); got != 2 {
+		t.Errorf("publish delay samples = %v, want 2 (one per published event)", got)
 	}
 }
 
@@ -344,7 +358,7 @@ func TestStopReleasesUnstartedClaims(t *testing.T) {
 	relay := app.NewOutboxRelay(e.uow, slow, app.SystemClock{}, app.OutboxRelayConfig{
 		Owner: "publisher-stopping", BatchSize: 50, Lease: 30 * time.Second, Concurrency: 1,
 		RetryBase: 100 * time.Millisecond, RetryMax: 400 * time.Millisecond,
-	}, quiet)
+	}, app.NopMetrics{}, quiet)
 	stopping := make(chan struct{})
 	go func() {
 		for slow.total() == 0 {
@@ -410,4 +424,79 @@ func TestOutboxLoopLifecycle(t *testing.T) {
 	if e.pending(t) != 0 {
 		t.Fatalf("loop left %d pending events", e.pending(t))
 	}
+}
+
+// TestGaugeLoopReportsBacklogAndDeadLetters: o refresher lê a outbox e a
+// profundidade das DLQs; uma fila inexistente não derruba as demais leituras.
+func TestGaugeLoopReportsBacklogAndDeadLetters(t *testing.T) {
+	e := newEnv(t)
+	e.openWallet(t, "10.00") // 2 eventos pendentes
+	dlqName := "gauge-" + suffix() + "-dlq.fifo"
+	dlqURL := createQueue(t, dlqName)
+	if _, err := sqsClient.SendMessage(context.Background(), &sqs.SendMessageInput{QueueUrl: aws.String(dlqURL),
+		MessageBody: aws.String("{}"), MessageGroupId: aws.String("g"), MessageDeduplicationId: aws.String("d")}); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := prometheus.NewRegistry()
+	var logs bytes.Buffer
+	var logMu sync.Mutex
+	logger := slog.New(slog.NewJSONHandler(lockedWriter{&logMu, &logs}, nil))
+	loop := worker.NewGaugeLoop(e.uow, sqsClient, []string{"missing-" + suffix() + ".fifo", dlqName},
+		metrics.New(reg), app.SystemClock{}, 50*time.Millisecond, logger)
+	if err := loop.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = loop.Stop(ctx)
+	}()
+	gauge := func(name string, labels map[string]string) float64 {
+		return metricstest.Value(t, reg, name, labels)
+	}
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for %s", what)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	waitFor("backlog and dead-letter depth", func() bool {
+		return gauge("wallet_outbox_pending_events", map[string]string{}) == 2 &&
+			gauge("wallet_outbox_oldest_pending_age_seconds", map[string]string{}) > 0 &&
+			gauge("wallet_dead_letter_queue_messages", map[string]string{"queue": dlqName}) == 1
+	})
+
+	drain(t, e, e.relay("publisher-gauge", e.recorder(), 30*time.Second), 10*time.Second)
+	waitFor("empty backlog", func() bool {
+		return gauge("wallet_outbox_pending_events", map[string]string{}) == 0 &&
+			gauge("wallet_outbox_oldest_pending_age_seconds", map[string]string{}) == 0
+	})
+
+	logMu.Lock()
+	defer logMu.Unlock()
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if n := strings.Count(line, `"component"`); n != 1 {
+			t.Errorf("component appears %d times: %s", n, line)
+		}
+	}
+	if !strings.Contains(logs.String(), "reading dead-letter queue depth failed") {
+		t.Error("missing queue was not logged")
+	}
+}
+
+// lockedWriter serializa escritas no buffer de log do teste.
+type lockedWriter struct {
+	mu  *sync.Mutex
+	buf *bytes.Buffer
+}
+
+func (w lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
 }

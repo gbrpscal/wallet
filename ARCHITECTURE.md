@@ -50,6 +50,8 @@ internal/adapters/
   sqs/                       cliente, consumidor e publisher
 internal/platform/
   config/  logging/  health/ configuração, logs JSON e readiness
+  logctx/                    atributos de log carregados pelo contexto
+  metrics/                   implementação Prometheus da porta app.Metrics e servidor /metrics
 migrations/                  schema, constraints e triggers (goose)
 deploy/                      papéis do PostgreSQL, realm do Keycloak, filas, Toxiproxy
 scripts/mutation.sh          testes de mutação curados
@@ -71,7 +73,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 6 | HTTP e autenticação | concluída |
 | 7 | Consumidor SQS | concluída |
 | 8 | Outbox e workers | concluída |
-| 9 | Observabilidade | pendente |
+| 9 | Observabilidade | concluída |
 | 10 | Testes de concorrência, multi-instância e falha | pendente |
 | 11 | Documentação final | pendente |
 | 12 | Verificação final | pendente |
@@ -1067,7 +1069,7 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
 - **Contexto:** "Fx compõe configuração, conexões, repositórios, casos de uso, handlers e workers […] fechamento das dependências depois dos componentes que as utilizam."
 - **Implementado até aqui:**
   - A configuração é carregada e validada **antes** do Fx. Uma configuração inválida encerra o processo com código 1, antes de abrir qualquer conexão.
-  - Módulos `logging`, `postgres`, `sqs`, `app` e `httpapi` (`fx.Module` / `fx.Provide` / `fx.Invoke`), com logs do Fx em JSON via `fxevent.SlogLogger`.
+  - Módulos `logging`, `metrics`, `postgres`, `sqs`, `app`, `httpapi` e `worker` (`fx.Module` / `fx.Provide` / `fx.Invoke`), com logs do Fx em JSON via `fxevent.SlogLogger`.
   - As checagens de readiness são reunidas por um *value group* (`group:"readiness"`), e cada adaptador contribui com a sua.
   - O servidor HTTP abre o listener no `OnStart`, de modo que uma porta ocupada faz a inicialização falhar.
   - No `OnStop`, a readiness passa a falhar e o servidor drena as requisições dentro de `SHUTDOWN_TIMEOUT` (`fx.StopTimeout`).
@@ -1148,7 +1150,7 @@ Todas as escolhas desta seção foram feitas explicitamente, uma a uma. Os event
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 87 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência, 12 de casos de uso, 11 de HTTP e autenticação, 10 do consumidor SQS e 9 da outbox e dos workers (os cinco últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
+- **Como verificar:** o comando abaixo, que hoje dá 118 mutantes mortos e 0 problemas: 28 de domínio, 5 de logs e métricas, 20 de persistência, 23 de casos de uso, 16 de HTTP e autenticação, 12 do consumidor SQS e 14 da outbox e dos workers (os cinco últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
@@ -1159,8 +1161,87 @@ docker compose run --rm tools bash scripts/mutation.sh
 #### Configuração e logs
 
 - **Configuração:** variáveis de ambiente lidas com a stdlib (`os.LookupEnv`), parse e validação explícitos. A alternativa (`caarlos0/env`) foi descartada para não ter dependência extra nem validação implícita. As credenciais da AWS não entram em `Config`: o SDK as lê direto do ambiente.
-- **Logs:** `log/slog` com `JSONHandler`, sem dependência extra. `zap` foi descartado por não trazer ganho necessário neste escopo.
+- **Logs:** `log/slog` com `JSONHandler`, sem dependência extra. `zap` foi descartado por não trazer ganho necessário neste escopo. Atributos de contexto, access log e regras de conteúdo estão no §4.18.
 - **Readiness:** os detalhes de erro vão para o log, nunca para a resposta pública.
+
+### 4.18 Observabilidade
+
+Todas as escolhas desta seção foram feitas explicitamente, uma a uma.
+
+#### Biblioteca e exposição das métricas
+
+- **Contexto:** "Logs estruturados com IDs relevantes, métricas de operações, latência, duplicatas, retries, DLQ, conflitos de concorrência, atraso da outbox e divergência de reconciliação."
+- **Opções consideradas:** (a) `prometheus/client_golang`; (b) OpenTelemetry com exportador Prometheus; (c) `expvar` da stdlib.
+- **Prós e contras:**
+  - (a) é o padrão de fato para o formato Prometheus, com histogramas e registry testável.
+  - (b) é neutro de fornecedor, porém traz mais dependências e configuração sem ganho neste escopo.
+  - (c) não tem labels nem histogramas.
+- **Escolha e justificativa:** (a). As métricas ficam em `GET /metrics` numa **porta separada** (`METRICS_ADDR`, padrão `:9090`), não publicada no host: só a rede interna as alcança. Assim, a superfície pública continua sendo só a API autenticada, e a coleta não depende de token. Os coletores padrão do runtime Go e do processo são registrados.
+- **Critério impactado:** Observabilidade.
+- **Como verificar:** com a stack no ar, `docker compose run --rm tools curl -s http://app:9090/metrics` lista as séries `wallet_*`, `go_*` e `process_*`; `curl localhost:9090` no host não conecta.
+- **Limitações:** não há Prometheus nem dashboards no Compose; a coleta fica a cargo do ambiente.
+
+#### Porta de métricas na camada de aplicação
+
+- **Opções consideradas:** (a) interface `app.Metrics`, com implementação Prometheus em `internal/platform/metrics` e `NopMetrics` para quem não mede; (b) chamar o Prometheus direto nos casos de uso.
+- **Escolha e justificativa:** (a). A camada `app` registra fatos ("operação concluída", "retry por versão desatualizada") sem conhecer a biblioteca, mantendo a regra de dependência para dentro. Cada teste cria o seu próprio registry, então as asserções não interferem umas nas outras.
+- **Como verificar:** `TestCatalog` (cada método alimenta a série certa) e os testes de integração com registry próprio listados abaixo.
+
+#### Catálogo
+
+| Métrica | Tipo | Labels |
+|---|---|---|
+| `wallet_operations_total` | counter | `channel`, `kind`, `status`, `failure_code` |
+| `wallet_operation_duration_seconds` | histograma (buckets padrão) | `channel`, `kind`, `outcome` |
+| `wallet_duplicates_total` | counter | `channel`, `reason` (`idempotent_replay`, `inbox_redelivery`) |
+| `wallet_retries_total` | counter | `component` (`usecase`, `sqs_consumer`, `outbox_publisher`), `reason` |
+| `wallet_dead_letters_total` | counter | `queue`, `error_code` |
+| `wallet_dead_letter_queue_messages` | gauge | `queue` |
+| `wallet_concurrency_conflicts_total` | counter | `kind` (`stale_version`, `lock_timeout`, `deadlock`, `serialization`, `unique`) |
+| `wallet_outbox_publish_delay_seconds` | histograma (padrão + 30 s, 60 s, 5 min, 15 min) | — |
+| `wallet_outbox_pending_events`, `wallet_outbox_oldest_pending_age_seconds` | gauges | — |
+| `wallet_reconciliations_total` | counter | `result` (`consistent`, `divergent`) |
+| `wallet_pending_reference_attempts_total` | counter | `result` (`waiting`, `completed`, `expired`) |
+
+- **Sem label de provedor ou carteira:** ids teriam cardinalidade sem limite. O provedor aparece nos logs. `kind` inválido vira `unknown`, pelo mesmo motivo.
+- **DLQ:** o counter mede o que o consumidor envia (por código); o gauge mede a profundidade real das duas DLQs (entrada e eventos), incluindo o que chegou pelo redrive do SQS ou da assinatura, que o processo não vê.
+- **Buckets:** os padrões cobrem a latência das operações; o atraso da outbox ganhou buckets longos porque o backoff do publisher vai até 5 min.
+
+#### O que conta como operação, duplicata e erro
+
+- **Escolha:**
+  - replays e reentregas contam **só** em `wallet_duplicates_total`; `wallet_operations_total` conta cada operação uma única vez;
+  - erros (validação, conflito, indisponibilidade) entram **só** no histograma, com `outcome` igual ao código estável da API, como `AMOUNT_MUST_BE_POSITIVE` ou `UNAVAILABLE`; rejeições persistidas são operações (`status=REJECTED` com `failure_code`);
+  - a abertura com saldo positivo conta como `OPENING`; as conclusões e expirações de pendências contam no canal `worker`.
+- **Latência:** medida no caso de uso (mesma régua para HTTP, SQS e worker), sem o tempo de rede e de autenticação.
+- **Como verificar:** `TestMetricsFiftyIdenticalBets` (50 apostas iguais: 1 operação, 49 duplicatas, 50 amostras), `TestMetricsRejectionAndErrors`, `TestMetricsMessageChannel`, `TestMetricsPendingReferenceExpiration`.
+
+#### Conflitos e retries
+
+- **Conflitos** são contados no adaptador de banco, que é quem conhece o SQLSTATE: `40001` → `serialization`, `40P01` → `deadlock`, `55P03` → `lock_timeout`, versão desatualizada → `stale_version` e unicidade → `unique`. A contagem acontece ao fim de cada transação da UnitOfWork.
+- **Retries** são contados por quem repete: o caso de uso (pelo motivo da falha anterior), o consumidor SQS (falha transitória) e o publisher (erro do broker).
+- **Como verificar:** `TestSaveDetectsStaleVersion`, `TestLockTimeoutIsTransient`, `TestIdempotencyConstraints`, `TestMetricsUseCaseRetries` (UnitOfWork que falha uma vez por versão e uma por indisponibilidade antes de delegar), `TestTransientFailureIsRetried`, `TestBrokerUnavailableIsRetriedWithBackoff`.
+
+#### Dinheiro fora das métricas
+
+- **Contexto:** o enunciado pede métrica de divergência de reconciliação e proíbe `float32`/`float64` para dinheiro; as métricas Prometheus são `float64`.
+- **Opções consideradas:** (a) gauge com o valor da divergência; (b) só a contagem de reconciliações por resultado.
+- **Escolha e justificativa:** (b). O valor da divergência continua na resposta da reconciliação e no log de `error`. O teste de ausência de ponto flutuante ignora apenas o pacote `internal/platform/metrics`, e `TestMetricsNeverSeeMoney` garante que esse pacote não importa `money`, `wallet` nem `wagering`.
+- **Limitações:** um alerta de divergência informa que ela existe, não o tamanho; o tamanho está no log.
+
+#### Atualização dos gauges
+
+- Um loop (`gauge-refresher`) lê a cada `METRICS_REFRESH_INTERVAL` (padrão 15 s) o backlog da outbox, numa transação somente leitura, e a profundidade das DLQs (mensagens visíveis + em voo). Só roda com as métricas ligadas. Uma fila inexistente é logada em `warn` e não impede a leitura das demais.
+- **Como verificar:** `TestGaugeLoopReportsBacklogAndDeadLetters`.
+- **Limitações:** com várias instâncias, cada uma publica o mesmo gauge global; a agregação deve usar `max`, não soma.
+
+#### Logs
+
+- **Atributos de contexto:** o pacote `logctx` guarda atributos no `context.Context` (`correlationId`, `clientId`, `providerId`, `walletId`, `messageId`, `transactionId`), e um handler os acrescenta a cada linha. Uma chave repetida substitui a anterior, e o contexto pai não é alterado.
+- **Access log:** uma linha `info` por requisição com método, **padrão da rota** (nunca a URL com ids), status, duração, `clientId` e `providerId`. Health checks vão para `debug`, e rotas inexistentes aparecem como `unmatched`.
+- **Conteúdo:** só ids e códigos. Tokens, `Authorization`, segredos e valores monetários nunca entram; a exceção é o log de divergência de reconciliação, cujo valor é o diagnóstico.
+- **Como verificar:** `TestContextAttributesReachEveryLine`, `TestContextIsNotMutated`, `TestAccessLog`, `TestLogsCarryNoCredentialsOrMoney` (API, inclusive com token inválido e JSON quebrado) e `TestLogsCarryIdsButNoMoney` (casos de uso).
+- **Correção nesta fase:** o worker de referências (Fase 8) registrava `component` duas vezes em cada linha; o logger com o componente era passado ao loop, que o acrescentava de novo. Corrigido, junto com o mesmo padrão no `gauge-refresher`; `TestGaugeLoopReportsBacklogAndDeadLetters` confere uma única ocorrência.
 
 ---
 
@@ -1173,8 +1254,8 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12); HTTP × SQS nas duas ordens e reentregas deduplicadas pela inbox (§4.14) | reinício de todos os processos |
 | Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12); consumidor com inbox na mesma transação, DLQ imediata para erros permanentes, backoff e redrive, queda entre commit e remoção, heartbeat e encerramento seguro (§4.14); publisher da outbox com reserva por lease, ordem por agregado, backoff sem desistir, recuperação de trabalho abandonado, republicação com o mesmo eventId e DLQ da assinatura; worker de referências paralelo por carteira (§4.15) | quedas reais (Fase 10) |
 | Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.16); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
-| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real, consumidor e publisher com LocalStack real) com PostgreSQL real, todos com `-race`; 87/87 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso, 11 de HTTP e autenticação, 10 do consumidor, 9 da outbox e dos workers (§4.17) | paralelismo multiprocesso, falhas com Toxiproxy |
-| Observabilidade | 5 | logs JSON; `/health/live`; `/health/ready` com PostgreSQL e SQS | IDs nos logs; métricas |
+| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real, consumidor e publisher com LocalStack real) com PostgreSQL real, todos com `-race`; 118/118 mutantes mortos: 28 de domínio, 5 de logs e métricas, 20 de SQL e repositórios, 23 de casos de uso, 16 de HTTP e autenticação, 12 do consumidor, 14 da outbox e dos workers (§4.17) | paralelismo multiprocesso, falhas com Toxiproxy |
+| Observabilidade | 5 | logs JSON com ids pelo contexto e access log, sem credenciais nem valores; métricas Prometheus de operações, latência, duplicatas, retries, DLQ, conflitos, atraso e backlog da outbox, reconciliação e pendências, em porta interna; `/health/live`; `/health/ready` com PostgreSQL e SQS (§4.18) | — |
 | Documentação | 5 | este documento e o README | revisão final |
 
 ---
@@ -1197,7 +1278,9 @@ docker compose run --rm tools bash scripts/mutation.sh
 
 ## 7. Limitações e trabalho não concluído
 
-- Métricas ainda não foram implementadas (Fase 9).
+- A divergência de reconciliação é contada nas métricas, mas o valor fica só na resposta e no log (§4.18).
+- Os gauges globais (backlog da outbox, profundidade das DLQs) são publicados por todas as instâncias; a agregação deve usar `max` (§4.18).
+- Não há Prometheus nem dashboards no Compose; as métricas ficam disponíveis para coleta na rede interna.
 - A deduplicação de eventos pelo broker vale por 5 minutos; depois disso, cabe ao consumidor deduplicar pelo `eventId` (§4.15).
 - Todas as decisões D1–D15 estão tomadas.
 - O LocalStack comunitário não aplica as políticas de acesso das filas (§4.14).

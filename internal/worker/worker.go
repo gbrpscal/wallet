@@ -10,9 +10,13 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"go.uber.org/fx"
 
 	"github.com/gbrpscal/wallet/internal/adapters/sns"
@@ -24,7 +28,7 @@ import (
 // Module liga os workers ao ciclo de vida. Eles param antes do pool do
 // PostgreSQL (ordem inversa de inicialização).
 var Module = fx.Module("worker",
-	fx.Invoke(StartOutboxWorker, StartReferenceWorker),
+	fx.Invoke(StartOutboxWorker, StartReferenceWorker, StartGaugeRefresher),
 )
 
 // OwnerID identifica esta instância nas reservas: hostname mais um sufixo
@@ -117,7 +121,7 @@ func NewOutboxLoop(relay *app.OutboxRelay, idle time.Duration, log *slog.Logger)
 }
 
 // StartOutboxWorker liga o publisher da outbox, se habilitado.
-func StartOutboxWorker(lc fx.Lifecycle, cfg config.Config, uow app.UnitOfWork, clock app.Clock, log *slog.Logger) error {
+func StartOutboxWorker(lc fx.Lifecycle, cfg config.Config, uow app.UnitOfWork, clock app.Clock, metrics app.Metrics, log *slog.Logger) error {
 	if !cfg.OutboxPublisherEnabled {
 		log.Info("outbox publisher disabled")
 		return nil
@@ -129,7 +133,7 @@ func StartOutboxWorker(lc fx.Lifecycle, cfg config.Config, uow app.UnitOfWork, c
 	relay := app.NewOutboxRelay(uow, sns.NewPublisher(client, cfg.SNSEventsTopicARN), clock, app.OutboxRelayConfig{
 		Owner: OwnerID(), BatchSize: cfg.OutboxBatchSize, Lease: cfg.OutboxLease,
 		Concurrency: cfg.OutboxPublishConcurrency, RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax,
-	}, log)
+	}, metrics, log)
 	l := NewOutboxLoop(relay, cfg.OutboxIdleInterval, log)
 	lc.Append(fx.Hook{OnStart: l.Start, OnStop: l.Stop})
 	return nil
@@ -146,8 +150,9 @@ type ReferenceResolver interface {
 // concurrency), as da mesma carteira em sequência. Um erro numa pendência é
 // logado e não conta como tentativa: ela volta no próximo ciclo.
 func NewReferenceLoop(r ReferenceResolver, interval time.Duration, batch, concurrency int, log *slog.Logger) *Loop {
+	base := log
 	log = log.With("component", "reference-worker")
-	return newLoop("reference-worker", log, interval, func(ctx context.Context, stopping <-chan struct{}) bool {
+	return newLoop("reference-worker", base, interval, func(ctx context.Context, stopping <-chan struct{}) bool {
 		due, err := r.DuePendingReferences(ctx, batch)
 		if err != nil {
 			log.Warn("listing due pending references failed", "error", err)
@@ -202,5 +207,71 @@ func StartReferenceWorker(lc fx.Lifecycle, cfg config.Config, svc *app.Service, 
 		return
 	}
 	l := NewReferenceLoop(svc, cfg.ReferenceWorkerInterval, cfg.ReferenceWorkerBatch, cfg.ReferenceWorkerConcurrency, log)
+	lc.Append(fx.Hook{OnStart: l.Start, OnStop: l.Stop})
+}
+
+// NewGaugeLoop atualiza, a cada interval, os gauges globais: eventos
+// pendentes na outbox (e a idade do mais antigo) e a profundidade das DLQs.
+// Cada instância publica o mesmo valor global; o coletor agrega por instância.
+func NewGaugeLoop(uow app.UnitOfWork, client *awssqs.Client, dlqs []string, metrics app.Metrics, clock app.Clock, interval time.Duration, log *slog.Logger) *Loop {
+	base := log
+	log = log.With("component", "gauge-refresher")
+	return newLoop("gauge-refresher", base, interval, func(ctx context.Context, _ <-chan struct{}) bool {
+		var pending int
+		var oldest time.Time
+		err := uow.View(ctx, func(ctx context.Context, tx app.Tx) error {
+			var err error
+			pending, oldest, err = tx.Outbox().Backlog(ctx)
+			return err
+		})
+		if err != nil {
+			log.Warn("reading outbox backlog failed", "error", err)
+		} else {
+			var age time.Duration
+			if !oldest.IsZero() {
+				age = clock.Now().Sub(oldest)
+			}
+			metrics.OutboxBacklog(pending, age)
+		}
+		for _, name := range dlqs {
+			n, err := queueDepth(ctx, client, name)
+			if err != nil {
+				log.Warn("reading dead-letter queue depth failed", "queue", name, "error", err)
+				continue
+			}
+			metrics.DeadLetterDepth(name, n)
+		}
+		return false
+	})
+}
+
+// queueDepth soma as mensagens visíveis e em voo da fila.
+func queueDepth(ctx context.Context, client *awssqs.Client, name string) (int, error) {
+	url, err := client.GetQueueUrl(ctx, &awssqs.GetQueueUrlInput{QueueName: aws.String(name)})
+	if err != nil {
+		return 0, err
+	}
+	out, err := client.GetQueueAttributes(ctx, &awssqs.GetQueueAttributesInput{
+		QueueUrl: url.QueueUrl,
+		AttributeNames: []sqstypes.QueueAttributeName{
+			sqstypes.QueueAttributeNameApproximateNumberOfMessages,
+			sqstypes.QueueAttributeNameApproximateNumberOfMessagesNotVisible,
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	visible, _ := strconv.Atoi(out.Attributes[string(sqstypes.QueueAttributeNameApproximateNumberOfMessages)])
+	inflight, _ := strconv.Atoi(out.Attributes[string(sqstypes.QueueAttributeNameApproximateNumberOfMessagesNotVisible)])
+	return visible + inflight, nil
+}
+
+// StartGaugeRefresher liga a atualização dos gauges, se as métricas estiverem
+// habilitadas.
+func StartGaugeRefresher(lc fx.Lifecycle, cfg config.Config, uow app.UnitOfWork, client *awssqs.Client, metrics app.Metrics, clock app.Clock, log *slog.Logger) {
+	if !cfg.MetricsEnabled {
+		return
+	}
+	l := NewGaugeLoop(uow, client, []string{cfg.WagerDLQName, cfg.EventsDLQName}, metrics, clock, cfg.MetricsRefreshInterval, log)
 	lc.Append(fx.Hook{OnStart: l.Start, OnStop: l.Stop})
 }

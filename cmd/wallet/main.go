@@ -13,6 +13,7 @@ import (
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/platform/config"
 	"github.com/gbrpscal/wallet/internal/platform/logging"
+	"github.com/gbrpscal/wallet/internal/platform/metrics"
 	"github.com/gbrpscal/wallet/internal/worker"
 )
 
@@ -28,6 +29,7 @@ func main() {
 		fx.StopTimeout(cfg.ShutdownTimeout),
 		fx.WithLogger(logging.FxLogger),
 		logging.Module,
+		metrics.Module,
 		postgres.Module,
 		sqs.Module,
 		app.Module,

@@ -60,6 +60,11 @@ type Config struct {
 	ReferenceWorkerInterval    time.Duration
 	ReferenceWorkerBatch       int
 	ReferenceWorkerConcurrency int
+	// Métricas e observabilidade (Fase 9).
+	MetricsEnabled         bool
+	MetricsAddr            string
+	MetricsRefreshInterval time.Duration
+	EventsDLQName          string
 }
 
 // Load lê o ambiente e devolve um Config validado.
@@ -117,6 +122,10 @@ func Load() (Config, error) {
 	cfg.ReferenceWorkerInterval = durationOr("REFERENCE_WORKER_INTERVAL", time.Second, &errs)
 	cfg.ReferenceWorkerBatch = intOr("REFERENCE_WORKER_BATCH", 50, &errs)
 	cfg.ReferenceWorkerConcurrency = intOr("REFERENCE_WORKER_CONCURRENCY", 8, &errs)
+	cfg.MetricsEnabled = boolOr("METRICS_ENABLED", true, &errs)
+	cfg.MetricsAddr = stringOr("METRICS_ADDR", ":9090")
+	cfg.MetricsRefreshInterval = durationOr("METRICS_REFRESH_INTERVAL", 15*time.Second, &errs)
+	cfg.EventsDLQName = stringOr("SQS_EVENTS_DLQ_NAME", "wallet-events-audit-dlq.fifo")
 	if cfg.OutboxPublisherEnabled && cfg.SNSEventsTopicARN == "" {
 		errs = append(errs, errors.New("SNS_EVENTS_TOPIC_ARN is required when the outbox publisher is enabled"))
 	}

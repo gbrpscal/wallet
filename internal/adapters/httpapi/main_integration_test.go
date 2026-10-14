@@ -25,13 +25,40 @@ import (
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/domain"
 	"github.com/gbrpscal/wallet/internal/platform/config"
+	"github.com/gbrpscal/wallet/internal/platform/logctx"
 	"github.com/gbrpscal/wallet/internal/testutil/pgtest"
 )
 
 var (
 	server  *httptest.Server
 	appPool *pgxpool.Pool
+	logs    = &logBuffer{}
 )
+
+// logBuffer guarda os logs da API para os testes que os inspecionam.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// lines devolve as linhas de log que contêm o trecho informado.
+func (b *logBuffer) lines(contains string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []string
+	for _, l := range strings.Split(b.buf.String(), "\n") {
+		if strings.Contains(l, contains) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
 
 // TestMain sobe a API completa (rotas, autenticação, casos de uso) sobre um
 // banco temporário, validando tokens do Keycloak real.
@@ -54,9 +81,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "OIDC_ISSUER, OIDC_JWKS_URL and OIDC_TOKEN_URL are required")
 		os.Exit(1)
 	}
-	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	svc := app.NewService(postgres.NewUnitOfWork(db.App, 5*time.Second), app.SystemClock{},
-		app.DefaultRetryPolicy, app.DefaultReferencePolicy, log)
+	log := slog.New(logctx.Handler{Handler: slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})})
+	svc := app.NewService(postgres.NewUnitOfWork(db.App, 5*time.Second, app.NopMetrics{}), app.SystemClock{},
+		app.DefaultRetryPolicy, app.DefaultReferencePolicy, app.NopMetrics{}, log)
 	api := httpapi.NewAPI(svc, httpapi.NewOIDCAuthenticator(cfg), log)
 	health := httpapi.NewHealthHandler(httpapi.HealthParams{Config: cfg, Log: log})
 	server = httptest.NewServer(httpapi.NewHandler(health, api, log))

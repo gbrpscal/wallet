@@ -93,6 +93,11 @@ func TestValidateTextID(t *testing.T) {
 	}
 }
 
+// metricsPackage é a única exceção ao teste de ponto flutuante: a biblioteca
+// de métricas só aceita float64. Ela conta e mede tempo, nunca carrega
+// dinheiro, e TestMetricsNeverSeeMoney garante isso.
+var metricsPackage = filepath.Join("..", "platform", "metrics")
+
 // TestNoFloatingPointInProductionCode falha se algum arquivo Go de produção em
 // internal/ ou cmd/ mencionar float32 ou float64, para que dinheiro nunca passe
 // por ponto flutuante.
@@ -101,6 +106,9 @@ func TestNoFloatingPointInProductionCode(t *testing.T) {
 	fset := token.NewFileSet()
 	for _, root := range roots {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() && path == metricsPackage {
+				return filepath.SkipDir
+			}
 			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 				return err
 			}
@@ -140,6 +148,38 @@ func TestDomainHasNoInfrastructureImports(t *testing.T) {
 			for _, bad := range forbidden {
 				if strings.HasPrefix(p, bad) {
 					t.Errorf("%s imports %s", path, p)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMetricsNeverSeeMoney: o pacote de métricas (única exceção ao teste de
+// ponto flutuante) não pode importar os pacotes de dinheiro e de domínio
+// financeiro, então nenhum valor monetário chega a uma métrica.
+func TestMetricsNeverSeeMoney(t *testing.T) {
+	forbidden := []string{
+		"github.com/gbrpscal/wallet/internal/domain/money",
+		"github.com/gbrpscal/wallet/internal/domain/wallet",
+		"github.com/gbrpscal/wallet/internal/domain/wagering",
+	}
+	fset := token.NewFileSet()
+	err := filepath.WalkDir(metricsPackage, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, imp := range f.Imports {
+			for _, bad := range forbidden {
+				if strings.Trim(imp.Path.Value, `"`) == bad {
+					t.Errorf("%s imports %s", path, bad)
 				}
 			}
 		}

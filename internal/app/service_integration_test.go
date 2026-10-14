@@ -492,7 +492,7 @@ func TestRollbackOfWinWithoutFunds(t *testing.T) {
 }
 
 func TestReconciliation(t *testing.T) {
-	h := newHarness()
+	h, reg := newMetricsHarness()
 	ctx := context.Background()
 	walletID := h.open(t, "1000.00")
 	h.submit(t, h.request(t, walletID, "rec-bet", "BET", "25.00", ""))
@@ -527,6 +527,8 @@ func TestReconciliation(t *testing.T) {
 	if !strings.Contains(h.logs.String(), "reconciliation divergence") {
 		t.Error("divergence not logged")
 	}
+	assertMetric(t, reg, "wallet_reconciliations_total", map[string]string{"result": "consistent"}, 1)
+	assertMetric(t, reg, "wallet_reconciliations_total", map[string]string{"result": "divergent"}, 1)
 	w, _ := h.svc.GetWallet(ctx, id)
 	if w.Balance().Amount() != "990.00" {
 		t.Fatal("reconciliation must not change the balance")

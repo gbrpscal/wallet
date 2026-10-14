@@ -30,9 +30,12 @@ func (e *DuplicateError) Error() string { return "duplicate: " + e.Constraint }
 // Is faz errors.Is(err, ErrDuplicate) funcionar.
 func (e *DuplicateError) Is(target error) bool { return target == ErrDuplicate }
 
-// TransientError encapsula uma falha temporária preservando a causa.
+// TransientError encapsula uma falha temporária preservando a causa. Conflict
+// é o tipo de conflito de concorrência (ConflictDeadlock, ConflictLockTimeout,
+// ConflictSerialization), vazio para falhas de conexão ou disponibilidade.
 type TransientError struct {
-	Err error
+	Err      error
+	Conflict string
 }
 
 func (e *TransientError) Error() string { return "transient: " + e.Err.Error() }

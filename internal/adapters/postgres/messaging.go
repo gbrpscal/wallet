@@ -103,7 +103,7 @@ func (r outboxRepo) Claim(ctx context.Context, owner string, now, until time.Tim
 		SET claimed_by = $1, claimed_until = $3
 		FROM candidates c
 		WHERE o.event_id = c.event_id
-		RETURNING o.event_id::text, o.aggregate_id::text, o.event_type, o.payload::text, o.attempts, o.sequence`,
+		RETURNING o.event_id::text, o.aggregate_id::text, o.event_type, o.payload::text, o.attempts, o.sequence, o.occurred_at`,
 		owner, now, until, limit)
 	if err != nil {
 		return nil, translate(err)
@@ -118,7 +118,7 @@ func (r outboxRepo) Claim(ctx context.Context, owner string, now, until time.Tim
 	for rows.Next() {
 		var id, payload string
 		var c claimed
-		if err := rows.Scan(&id, &c.event.AggregateID, &c.event.EventType, &payload, &c.event.Attempts, &c.sequence); err != nil {
+		if err := rows.Scan(&id, &c.event.AggregateID, &c.event.EventType, &payload, &c.event.Attempts, &c.sequence, &c.event.OccurredAt); err != nil {
 			return nil, translate(err)
 		}
 		if c.event.ID, err = domain.ParseID[domain.EventID](id); err != nil {
@@ -189,4 +189,15 @@ func idStrings(ids []domain.EventID) []string {
 		out[i] = id.String()
 	}
 	return out
+}
+
+func (r outboxRepo) Backlog(ctx context.Context) (int, time.Time, error) {
+	var pending int
+	var oldest *time.Time
+	err := r.q.QueryRow(ctx, `
+		SELECT count(*), min(occurred_at) FROM outbox_events WHERE published_at IS NULL`).Scan(&pending, &oldest)
+	if err != nil || oldest == nil {
+		return pending, time.Time{}, translate(err)
+	}
+	return pending, *oldest, nil
 }

@@ -19,12 +19,14 @@ import (
 type UnitOfWork struct {
 	pool        *pgxpool.Pool
 	lockTimeout time.Duration
+	metrics     app.Metrics
 }
 
 // NewUnitOfWork cria a UnitOfWork. lockTimeout limita a espera por locks de
-// linha; ao estourar, o erro é transitório (55P03) e nada é confirmado.
-func NewUnitOfWork(pool *pgxpool.Pool, lockTimeout time.Duration) *UnitOfWork {
-	return &UnitOfWork{pool: pool, lockTimeout: lockTimeout}
+// linha; ao estourar, o erro é transitório (55P03) e nada é confirmado. Cada
+// conflito de concorrência classificado aqui é contado em metrics.
+func NewUnitOfWork(pool *pgxpool.Pool, lockTimeout time.Duration, metrics app.Metrics) *UnitOfWork {
+	return &UnitOfWork{pool: pool, lockTimeout: lockTimeout, metrics: metrics}
 }
 
 // Do executa fn em uma transação. Commit só acontece se fn não devolver erro;
@@ -41,6 +43,7 @@ func (u *UnitOfWork) View(ctx context.Context, fn func(ctx context.Context, tx a
 }
 
 func (u *UnitOfWork) run(ctx context.Context, opts pgx.TxOptions, fn func(ctx context.Context, tx app.Tx) error) (err error) {
+	defer func() { u.countConflict(err) }()
 	tx, err := u.pool.BeginTx(ctx, opts)
 	if err != nil {
 		return translate(err)
@@ -66,6 +69,24 @@ func (u *UnitOfWork) run(ctx context.Context, opts pgx.TxOptions, fn func(ctx co
 		return translate(err)
 	}
 	return nil
+}
+
+// countConflict registra o tipo de conflito de concorrência de um erro já
+// classificado: versão desatualizada, unicidade, deadlock, lock_timeout ou
+// serialização. Falhas de conexão não são conflitos.
+func (u *UnitOfWork) countConflict(err error) {
+	if err == nil {
+		return
+	}
+	var te *app.TransientError
+	switch {
+	case errors.As(err, &te) && te.Conflict != "":
+		u.metrics.ConcurrencyConflict(te.Conflict)
+	case errors.Is(err, app.ErrConcurrentUpdate):
+		u.metrics.ConcurrencyConflict(app.ConflictStaleVersion)
+	case errors.Is(err, app.ErrDuplicate):
+		u.metrics.ConcurrencyConflict(app.ConflictUnique)
+	}
 }
 
 // translateIfDB preserva erros já classificados (pelos repositórios ou pelo

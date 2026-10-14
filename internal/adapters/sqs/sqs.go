@@ -31,7 +31,7 @@ const ConsumerName = "wager-transactions-consumer"
 // StartConsumer liga o consumidor ao ciclo de vida do Fx. Ele para antes do
 // pool do PostgreSQL (ordem inversa de inicialização), então o trabalho em
 // andamento termina com o banco ainda disponível.
-func StartConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, svc *app.Service, log *slog.Logger) {
+func StartConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, svc *app.Service, metrics app.Metrics, log *slog.Logger) {
 	if !cfg.ConsumerEnabled {
 		log.Info("sqs consumer disabled")
 		return
@@ -40,7 +40,7 @@ func StartConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, svc *
 		Name: ConsumerName, QueueName: cfg.WagerQueueName, DLQName: cfg.WagerDLQName,
 		Pollers: cfg.ConsumerPollers, WaitTime: cfg.ConsumerWaitTime, Visibility: cfg.ConsumerVisibility,
 		RetryBase: cfg.ConsumerRetryBase, RetryMax: cfg.ConsumerRetryMax,
-	}, log)
+	}, metrics, log)
 	lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})
 }
 

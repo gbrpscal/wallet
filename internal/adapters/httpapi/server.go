@@ -26,14 +26,14 @@ var Module = fx.Module("httpapi",
 )
 
 // NewHandler registra todas as rotas: health checks públicos e as rotas
-// autenticadas da API, envolvidas pelos middlewares de correlação e de
-// recuperação de panic.
+// autenticadas da API, envolvidas pelos middlewares de correlação, access log
+// e recuperação de panic.
 func NewHandler(h *HealthHandler, api *API, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health/live", h.Live)
-	mux.HandleFunc("GET /health/ready", h.Ready)
+	mux.HandleFunc("GET /health/live", routed(h.Live))
+	mux.HandleFunc("GET /health/ready", routed(h.Ready))
 	api.routes(mux)
-	return withCorrelation(recoverer(log, mux))
+	return withCorrelation(accessLog(log, recoverer(log, mux)))
 }
 
 // StartServer abre o listener durante o start, para que uma porta ocupada
