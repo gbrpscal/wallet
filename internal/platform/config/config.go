@@ -36,6 +36,14 @@ type Config struct {
 	OIDCIssuer   string
 	OIDCJWKSURL  string
 	OIDCAudience string
+	// Consumidor SQS (D9).
+	WagerDLQName       string
+	ConsumerEnabled    bool
+	ConsumerPollers    int
+	ConsumerWaitTime   time.Duration
+	ConsumerVisibility time.Duration
+	ConsumerRetryBase  time.Duration
+	ConsumerRetryMax   time.Duration
 }
 
 // Load lê o ambiente e devolve um Config validado.
@@ -51,6 +59,7 @@ func Load() (Config, error) {
 		OIDCIssuer:     stringOr("OIDC_ISSUER", ""),
 		OIDCJWKSURL:    stringOr("OIDC_JWKS_URL", ""),
 		OIDCAudience:   stringOr("OIDC_AUDIENCE", "wallet-api"),
+		WagerDLQName:   stringOr("SQS_WAGER_DLQ_NAME", "wager-transactions-dlq.fifo"),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -73,6 +82,15 @@ func Load() (Config, error) {
 	cfg.ReferenceTTL = durationOr("REFERENCE_TTL", 10*time.Minute, &errs)
 	cfg.ReferenceBaseDelay = durationOr("REFERENCE_BACKOFF_BASE", time.Second, &errs)
 	cfg.ReferenceMaxDelay = durationOr("REFERENCE_BACKOFF_MAX", time.Minute, &errs)
+	cfg.ConsumerEnabled = boolOr("SQS_CONSUMER_ENABLED", true, &errs)
+	cfg.ConsumerPollers = intOr("SQS_CONSUMER_POLLERS", 2, &errs)
+	cfg.ConsumerWaitTime = durationOr("SQS_WAIT_TIME", 20*time.Second, &errs)
+	cfg.ConsumerVisibility = durationOr("SQS_VISIBILITY_TIMEOUT", 30*time.Second, &errs)
+	cfg.ConsumerRetryBase = durationOr("SQS_RETRY_BACKOFF_BASE", 2*time.Second, &errs)
+	cfg.ConsumerRetryMax = durationOr("SQS_RETRY_BACKOFF_MAX", time.Minute, &errs)
+	if cfg.ConsumerWaitTime > 20*time.Second {
+		errs = append(errs, errors.New("SQS_WAIT_TIME must not exceed 20s"))
+	}
 	if cfg.ReferenceBaseDelay > cfg.ReferenceMaxDelay {
 		errs = append(errs, errors.New("REFERENCE_BACKOFF_BASE must not exceed REFERENCE_BACKOFF_MAX"))
 	}
@@ -119,4 +137,17 @@ func intOr(key string, fallback int, errs *[]error) int {
 		return 0
 	}
 	return n
+}
+
+func boolOr(key string, fallback bool, errs *[]error) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s must be true or false", key))
+		return fallback
+	}
+	return b
 }

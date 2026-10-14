@@ -18,6 +18,9 @@
 #   ERROR    o trecho a mutar não foi encontrado (o código mudou)
 #
 # O script termina com código 1 se houver qualquer resultado diferente de KILLED.
+#
+# MUTATION_FILTER (expressão regular) roda só os mutantes cujo nome casar, por
+# exemplo: MUTATION_FILTER="inbox|DLQ" bash scripts/mutation.sh
 set -u
 
 SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -43,6 +46,9 @@ baseline() {
 # mutate <nome> <arquivo> <trecho original> <trecho mutado> [pacotes] [tags]
 mutate() {
   local name="$1" file="$2" from="$3" to="$4" pkgs="${5:-./internal/domain/...}" tags="${6:-}"
+  if [ -n "${MUTATION_FILTER:-}" ] && ! echo "$name" | grep -qE "$MUTATION_FILTER"; then
+    return
+  fi
   rm -rf "$WORK/src" && cp -r "$SRC" "$WORK/src"
   if ! FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/ or exit 3' "$WORK/src/$file"; then
     echo "ERROR    $name (trecho não encontrado em $file)"
@@ -250,6 +256,38 @@ mutate "Idempotency-Key opcional" internal/adapters/httpapi/handlers.go \
   'if key == "" {' 'if false {' $API integration
 mutate "X-Correlation-Id do cliente ignorado" internal/adapters/httpapi/correlation.go \
   'if domain.ValidateTextID("correlationId", id) != nil {' 'if true {' $API integration
+
+# --- Consumidor SQS e inbox (tag integration; exige PostgreSQL e LocalStack no ar) ---
+MQ=./internal/adapters/sqs/...
+baseline $MQ integration
+
+mutate "falha transitória remove a mensagem" internal/adapters/sqs/consumer.go \
+  'log.Warn("transient failure, message will be retried", "retryIn", d.String(), "error", err)
+		return d, true' 'c.delete(log, m)
+		return d, false' $MQ integration
+mutate "erro permanente tratado como transitório" internal/adapters/sqs/consumer.go \
+  'return ok && kind != domain.KindRejection' 'return false && ok && kind != domain.KindRejection' $MQ integration
+mutate "mensagem da DLQ não é removida da fila" internal/adapters/sqs/consumer.go \
+  'log.Warn("message sent to dead-letter queue", "errorCode", code, "error", cause)
+	c.delete(log, m)' 'log.Warn("message sent to dead-letter queue", "errorCode", code, "error", cause)' $MQ integration
+mutate "encerramento processa o que nem começou" internal/adapters/sqs/consumer.go \
+  'if c.pollCtx.Err() != nil {
+			// Encerrando' 'if false {
+			// Encerrando' $MQ integration
+mutate "prazo de parada não cancela o processamento" internal/adapters/sqs/consumer.go \
+  '	case <-ctx.Done():
+		c.cancelWork()' '	case <-ctx.Done():' $MQ integration
+mutate "sem heartbeat de visibilidade" internal/adapters/sqs/consumer.go \
+  'stopHeartbeat := c.heartbeat(m)' 'stopHeartbeat := func() {}' $MQ integration
+mutate "inbox ignora hash divergente" internal/app/service.go \
+  'if existing.PayloadHash != msg.PayloadHash {' 'if existing.PayloadHash != msg.PayloadHash && false {' $MQ integration
+mutate "inbox não conclui a mensagem" internal/app/service.go \
+  'return tx.Inbox().MarkCompleted(ctx, msg.ConsumerName, msg.MessageID, domain.Timestamp(s.clock.Now()))' 'return nil' $MQ integration
+mutate "envelope aceita tipo desconhecido" internal/adapters/sqs/message.go \
+  'if env.Type != MessageType {' 'if false {' $MQ
+mutate "envelope aceita campos desconhecidos" internal/adapters/sqs/message.go \
+  'dec := json.NewDecoder(bytes.NewReader([]byte(body)))
+	dec.DisallowUnknownFields()' 'dec := json.NewDecoder(bytes.NewReader([]byte(body)))' $MQ
 
 echo
 echo "mutantes mortos: $killed, problemas: $bad"

@@ -142,6 +142,58 @@ func (s *Service) SubmitOperation(ctx context.Context, in wagering.RequestInput,
 	return result, err
 }
 
+// MessageResult é o resultado do tratamento de uma mensagem recebida.
+type MessageResult struct {
+	// Operation é vazio quando a mensagem já tinha sido tratada (Duplicate).
+	Operation OperationResult
+	// Duplicate é true quando a inbox já registrava a mensagem: nada foi
+	// reprocessado e ela pode ser removida da fila.
+	Duplicate bool
+}
+
+// HandleMessage trata uma operação recebida por mensageria. O registro na
+// inbox, a operação (transação, ledger, saldo, eventos) e a conclusão na
+// inbox são confirmados na mesma transação SQL: depois do commit, a mensagem
+// pode ser removida da fila; antes dele, nada ficou gravado.
+//
+// A mesma messageId com conteúdo diferente resulta em MESSAGE_HASH_MISMATCH.
+// Mensagens diferentes com a mesma chave de idempotência seguem as regras de
+// replay de SubmitOperation, inclusive entre HTTP e SQS.
+func (s *Service) HandleMessage(ctx context.Context, msg InboxMessage, in wagering.RequestInput, trace event.Trace) (MessageResult, error) {
+	req, err := wagering.NewRequest(in)
+	if err != nil {
+		return MessageResult{}, err
+	}
+	if err := trace.Validate(); err != nil {
+		return MessageResult{}, err
+	}
+
+	var result MessageResult
+	err = s.retry.Do(ctx, func() error {
+		return s.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
+			result = MessageResult{}
+			msg.ReceivedAt = domain.Timestamp(s.clock.Now())
+			existing, inserted, err := tx.Inbox().Register(ctx, msg)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				if existing.PayloadHash != msg.PayloadHash {
+					return domain.Errorf(domain.ErrMessageHashMismatch,
+						"message %s was already received with different content", msg.MessageID)
+				}
+				result.Duplicate = true
+				return nil
+			}
+			if result.Operation, err = s.submit(ctx, tx, req, trace); err != nil {
+				return err
+			}
+			return tx.Inbox().MarkCompleted(ctx, msg.ConsumerName, msg.MessageID, domain.Timestamp(s.clock.Now()))
+		})
+	})
+	return result, err
+}
+
 func (s *Service) submit(ctx context.Context, tx Tx, req wagering.Request, trace event.Trace) (OperationResult, error) {
 	// 1) Replay rápido, sem travar a carteira.
 	if res, found, err := findExisting(ctx, tx, req); found || err != nil {

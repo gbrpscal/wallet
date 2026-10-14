@@ -71,6 +71,7 @@ const (
 	CodeInvalidTransition      Code = "INVALID_STATE_TRANSITION"
 	CodeWalletNotFound         Code = "WALLET_NOT_FOUND"
 	CodeTransactionNotFound    Code = "TRANSACTION_NOT_FOUND"
+	CodeMessageHashMismatch    Code = "MESSAGE_HASH_MISMATCH"
 )
 
 // Error é o único tipo de erro do domínio. Dois erros casam com errors.Is
@@ -124,6 +125,9 @@ var (
 	ErrInvalidTransition      = &Error{Kind: KindInvariant, Code: CodeInvalidTransition}
 	ErrWalletNotFound         = &Error{Kind: KindNotFound, Code: CodeWalletNotFound}
 	ErrTransactionNotFound    = &Error{Kind: KindNotFound, Code: CodeTransactionNotFound}
+	// ErrMessageHashMismatch: mensagem reentregue com o mesmo messageId e
+	// conteúdo diferente do registrado na inbox.
+	ErrMessageHashMismatch = &Error{Kind: KindConflict, Code: CodeMessageHashMismatch}
 )
 
 var byCode = func() map[Code]*Error {
@@ -134,7 +138,7 @@ var byCode = func() map[Code]*Error {
 		ErrExternalTxConflict, ErrWalletAlreadyExists, ErrInsufficientFunds, ErrReversalInsufficient,
 		ErrCurrencyMismatch, ErrWalletPlayerMismatch, ErrReferenceNotFound, ErrReferenceNotProcessed,
 		ErrReferenceMismatch, ErrReferenceAmount, ErrReferenceNotReversible, ErrAlreadyReversed,
-		ErrInconsistentState, ErrInvalidTransition, ErrWalletNotFound, ErrTransactionNotFound,
+		ErrInconsistentState, ErrInvalidTransition, ErrWalletNotFound, ErrTransactionNotFound, ErrMessageHashMismatch,
 	} {
 		m[e.Code] = e
 	}

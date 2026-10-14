@@ -101,6 +101,12 @@ Os valores padrão estão no `compose.yaml`, e o projeto funciona sem `.env`. O 
 | `AWS_ENDPOINT_URL` | — | Endpoint do SQS (LocalStack) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` / `test` | Credenciais (lidas pelo SDK da AWS) |
 | `SQS_WAGER_QUEUE_NAME` | `wager-transactions.fifo` | Fila de entrada |
+| `SQS_WAGER_DLQ_NAME` | `wager-transactions-dlq.fifo` | Dead-letter queue |
+| `SQS_CONSUMER_ENABLED` | `true` | Liga o consumidor (`false` para uma instância só HTTP) |
+| `SQS_CONSUMER_POLLERS` | `2` | Loops de recebimento por instância |
+| `SQS_WAIT_TIME` | `20s` | Long polling (máximo 20s) |
+| `SQS_VISIBILITY_TIMEOUT` | `30s` | Visibilidade de cada recebimento, renovada durante o processamento |
+| `SQS_RETRY_BACKOFF_BASE` / `SQS_RETRY_BACKOFF_MAX` | `2s` / `60s` | Backoff de falhas temporárias |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error` |
 | `SHUTDOWN_TIMEOUT` | `30s` | Prazo para concluir o trabalho em andamento no encerramento |
 | `READINESS_TIMEOUT` | `2s` | Timeout de cada checagem de readiness |
@@ -123,10 +129,62 @@ Uma configuração inválida (por exemplo, `SHUTDOWN_TIMEOUT=abc`) encerra o pro
 
 As filas são criadas automaticamente quando o LocalStack fica pronto, pelo script [deploy/localstack/init-queues.sh](deploy/localstack/init-queues.sh):
 
-- `wager-transactions.fifo`: entrada de operações;
-- `wager-transactions-dlq.fifo`: dead-letter queue.
+| Fila | Configuração |
+|---|---|
+| `wager-transactions.fifo` | entrada de operações; FIFO, visibility timeout de 30s, redrive para a DLQ após 5 recebimentos |
+| `wager-transactions-dlq.fifo` | dead-letter queue; retenção de 14 dias |
 
-*Pendente (Fase 7/8):* política de redrive, visibility timeout e o destino dos eventos de saída.
+O script também registra as políticas de acesso: só o produtor (`wager-producer`) envia, e só o consumidor (`wallet-consumer`) recebe e remove. O LocalStack comunitário **não aplica** essas políticas; elas valem tal qual na AWS (detalhes em [ARCHITECTURE.md](ARCHITECTURE.md), §4.14).
+
+### Contrato da mensagem
+
+Envie com `MessageGroupId` igual ao `walletId` (ordem por carteira) e `MessageDeduplicationId` igual ao `messageId`:
+
+```json
+{
+  "messageId": "msg-123",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-09-08T12:00:00.000Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-123",
+    "idempotencyKey": "provider-a:transaction-123",
+    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+    "walletId": "<id da carteira>",
+    "roundId": "round-987",
+    "gameId": "fortune-chimp",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+Para enviar uma mensagem pelo container do LocalStack (sem nada instalado no host), troque `<id da carteira>` por uma carteira existente:
+
+```bash
+docker compose exec localstack awslocal sqs send-message \
+  --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
+  --message-group-id "<id da carteira>" --message-deduplication-id msg-123 \
+  --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-123","idempotencyKey":"provider-a:transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<id da carteira>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+```
+
+### O que acontece com cada mensagem
+
+| Resultado | Ação |
+|---|---|
+| Processada, rejeitada por regra de negócio ou aguardando referência | confirmada e removida da fila |
+| Já recebida antes (mesmo `messageId` e mesmo conteúdo) | removida, sem reprocessar |
+| Inválida, carteira inexistente, conflito ou mesmo `messageId` com outro conteúdo | enviada à DLQ com `ErrorCode` e `ErrorDetail`, e removida |
+| Falha temporária (ex.: banco indisponível) | volta com backoff (2, 4, 8, 16s); na 5ª tentativa, vai para a DLQ pelo redrive |
+
+Para inspecionar a DLQ:
+
+```bash
+docker compose exec localstack awslocal sqs receive-message --max-number-of-messages 10 --message-attribute-names All \
+  --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo
+```
+
+*Pendente (Fase 8):* destino dos eventos de saída.
 
 ## Banco de dados e migrations
 
@@ -264,12 +322,12 @@ docker compose run --rm tools go test -race ./...
 | `internal/app` | política de espera (backoff, teto, expiração), retry de falhas transitórias, cursor do ledger |
 | `internal/adapters/httpapi` | header `Authorization`, JSON estrito, Money só como string, mapeamento de erros para HTTP, recuperação de panic |
 
-### Testes de integração (persistência, casos de uso e API)
+### Testes de integração (persistência, casos de uso, API e SQS)
 
 Os testes com a tag `integration` usam o PostgreSQL real do Compose. Cada pacote cria um banco temporário `wallet_test_<aleatório>` (helper em `internal/testutil/pgtest`), aplica as migrations como `wallet_owner`, executa os testes com o papel `wallet_app` e apaga o banco ao final. O banco da aplicação não é tocado.
 
 ```bash
-docker compose up -d --wait postgres keycloak
+docker compose up -d --wait postgres keycloak localstack
 ```
 
 ```bash
@@ -324,19 +382,33 @@ Forma nativa: exporte `DATABASE_URL` (papel `wallet_app`) e `DATABASE_OWNER_URL`
 | `TestOperationResponses`, `TestInputAndConflictErrors` | `422` com o corpo da rejeição, `202` com `Location`, `400`, `404`, `409` e `415`; erros corrigíveis não consomem a chave |
 | `TestWalletRules`, `TestCorrelationID` | abertura com zero, carteira duplicada, `X-Correlation-Id` propagado até a outbox |
 
+**Consumidor SQS** (`internal/adapters/sqs`, com LocalStack real; cada teste cria o seu par de filas com redrive)
+
+| Teste | O que comprova |
+|---|---|
+| `TestConsumesOperation` | mensagem do enunciado processada, inbox concluída, eventos com o `messageId` como correlationId |
+| `TestRedeliveredMessageIsNotReprocessed`, `TestDifferentMessagesSameKey` | reentrega do mesmo envelope e mensagens diferentes com a mesma chave geram um único débito (deduplicação da aplicação, sem depender do SQS) |
+| `TestHTTPAndSQSShareIdempotency` | a mesma operação por HTTP e por SQS, nas duas ordens, gera um único débito |
+| `TestInvalidMessagesGoToDeadLetterQueue`, `TestMessageHashMismatchGoesToDeadLetterQueue` | 8 tipos de mensagem inválida e `messageId` reutilizado vão à DLQ com o `ErrorCode` certo, sem efeito financeiro |
+| `TestBusinessOutcomesAreAcknowledged` | rejeição e espera por referência são confirmadas e removidas, sem DLQ |
+| `TestTransientFailureIsRetried`, `TestExhaustedRetriesGoToDeadLetterQueue` | falha temporária volta com backoff; após 5 recebimentos, o redrive move para a DLQ |
+| `TestCrashAfterCommitBeforeDelete` | queda entre o commit e a remoção: a reentrega é reconhecida pela inbox e não reprocessa |
+| `TestOrderWithinWallet`, `TestHeartbeatKeepsMessageInvisible` | ordem por carteira; processamento longo não deixa a mensagem reaparecer |
+| `TestGracefulShutdown`, `TestStopDeadlineCancelsInFlight` | SIGTERM conclui a mensagem em andamento e devolve as não iniciadas; prazo estourado cancela sem gravar nada |
+
 ### Testes de mutação
 
-O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado" e "audiência não conferida". Os mutantes de persistência, de casos de uso e de API exigem PostgreSQL e Keycloak no ar:
+O [scripts/mutation.sh](scripts/mutation.sh) comprova que os testes verificam as regras de fato. Cada mutante injeta um defeito numa cópia descartável do código e algum teste precisa falhar. Exemplos de defeito: "débito deixa o saldo negativo", "segunda reversão aceita", "aplicação pode alterar e apagar o ledger", "lock da carteira sem FOR UPDATE", "worker ignora o horário agendado" e "audiência não conferida". Os mutantes de persistência, de casos de uso, de API e do consumidor exigem PostgreSQL, Keycloak e LocalStack no ar:
 
 ```bash
-docker compose up -d --wait postgres keycloak
+docker compose up -d --wait postgres keycloak localstack
 ```
 
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
 
-Cada linha mostra o defeito e os testes que o detectaram (`KILLED`). `SURVIVED` indica regra sem teste, e `INVALID` indica mutante que não compila. Antes de cada grupo, os testes rodam sem mutação; se essa linha de base falhar (por exemplo, com o banco fora do ar), o script aborta em vez de contar falhas de ambiente como mutantes mortos. O script termina com erro se houver qualquer resultado diferente de `KILLED`.
+Cada linha mostra o defeito e os testes que o detectaram (`KILLED`). `SURVIVED` indica regra sem teste, e `INVALID` indica mutante que não compila. Antes de cada grupo, os testes rodam sem mutação; se essa linha de base falhar (por exemplo, com o banco fora do ar), o script aborta em vez de contar falhas de ambiente como mutantes mortos. O script termina com erro se houver qualquer resultado diferente de `KILLED`. Para rodar só um grupo, filtre pelo nome do mutante, por exemplo: `docker compose run --rm -e MUTATION_FILTER="inbox|DLQ" tools bash scripts/mutation.sh`.
 
 ## Testes de integração, múltiplas instâncias e falha
 

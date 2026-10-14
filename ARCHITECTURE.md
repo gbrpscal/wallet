@@ -23,7 +23,7 @@ Serviço em Go que movimenta carteiras de jogadores por uma API HTTP e por um co
 | Componente | Papel |
 |---|---|
 | API HTTP (`net/http`) | Abertura e consulta de carteiras, envio e consulta de operações, reconciliação e health checks. |
-| Consumidor SQS | Lê `wager-transactions.fifo` e usa o mesmo caso de uso da API. *(pendente)* |
+| Consumidor SQS | Lê `wager-transactions.fifo` e usa o mesmo caso de uso da API, com inbox na mesma transação SQL. |
 | Worker de referências | Retoma operações em `PENDING_REFERENCE` com backoff. *(pendente)* |
 | Publisher da outbox | Publica os eventos confirmados no banco. *(pendente)* |
 | PostgreSQL | Fonte da verdade: saldo, ledger, transações, inbox e outbox. |
@@ -69,7 +69,7 @@ A dependência é sempre para dentro: `adapters → app → domain`. Dentro do d
 | 4 | Persistência: migrations, constraints, repositórios | concluída |
 | 5 | Casos de uso | concluída |
 | 6 | HTTP e autenticação | concluída |
-| 7 | Consumidor SQS | pendente |
+| 7 | Consumidor SQS | concluída |
 | 8 | Outbox e workers | pendente |
 | 9 | Observabilidade | pendente |
 | 10 | Testes de concorrência, multi-instância e falha | pendente |
@@ -877,14 +877,104 @@ A API usa `net/http` (`ServeMux` com padrões de método e rota do Go 1.22+), se
 - Panic em handler vira 500 problem+json, sem derrubar o processo (`TestRecovererReturnsProblem`).
 - A readiness continua cobrindo só PostgreSQL e SQS, como pede o enunciado; o Keycloak não entra nela.
 
-### 4.14 Decisões pendentes
+### 4.14 Consumidor SQS
+
+O consumidor lê `wager-transactions.fifo` e chama o mesmo caso de uso do HTTP (`HandleMessage` envolve `SubmitOperation`), com o mesmo `RequestInput`, o mesmo hash e as mesmas regras de idempotência.
+
+#### Inbox na mesma transação SQL
+
+- **Contexto:** "Na entrada SQS, o registro da inbox e a conclusão durável do tratamento compartilham a mesma transação SQL das alterações de domínio, do ledger e dos eventos." / "Remover a mensagem somente após o commit do tratamento durável."
+- **Implementação:** `Service.HandleMessage` faz, num único commit:
+  1. registra `(consumerName, messageId, hash)` na inbox;
+  2. processa a operação (transação, ledger, saldo e eventos);
+  3. marca a mensagem como concluída na inbox.
+  
+  Só depois do commit o consumidor remove a mensagem da fila. Se a mensagem já está na inbox, ela é removida sem reprocessar. A `idempotencyKey` continua valendo à parte: mensagens diferentes com a mesma chave viram replay, inclusive entre HTTP e SQS.
+- **Hash da inbox:** SHA-256 do corpo recebido (`v1:<hex>`). Uma reentrega do SQS traz o corpo idêntico; o mesmo `messageId` com corpo diferente resulta em `MESSAGE_HASH_MISMATCH` e vai para a DLQ. A alternativa de ignorar e remover foi descartada, porque o conteúdo divergente sumiria sem rastro.
+- **Correlação:** o `correlationId` e o `causationId` dos eventos são o `messageId` do envelope.
+- **Como verificar:**
+  - `TestConsumesOperation` (inbox concluída e eventos correlacionados);
+  - `TestRedeliveredMessageIsNotReprocessed` (o mesmo envelope duas vezes, sem a deduplicação do SQS, gera um débito);
+  - `TestDifferentMessagesSameKey`, `TestHTTPAndSQSShareIdempotency` (HTTP→SQS e SQS→HTTP) e `TestMessageHashMismatchGoesToDeadLetterQueue`;
+  - mutantes "inbox não conclui a mensagem" e "inbox ignora hash divergente".
+
+#### D9. Parâmetros da fila
+
+| Parâmetro | Valor | Motivo |
+|---|---|---|
+| `MessageGroupId` | `walletId` | Ordem por carteira e paralelismo entre carteiras; casa com o lock por carteira (D1). Uma mensagem com problema só atrasa a própria carteira. `providerId` concentraria todas as carteiras de um provedor numa fila só; `playerId` misturaria moedas. |
+| `MessageDeduplicationId` | `messageId` do envelope | Primeira camada (janela de 5 min do SQS) contra reenvios do produtor. As garantias reais são a inbox e a idempotência no banco. Usar `idempotencyKey` descartaria em silêncio, no broker, um reenvio com conteúdo diferente, que deveria dar conflito. |
+| `ContentBasedDeduplication` | `false` | A identidade é o `messageId`, não o conteúdo. |
+| Visibility timeout | 30s, renovado a cada 10s durante o processamento (heartbeat) | Uma mensagem longa não reaparece para outra instância no meio do tratamento. |
+| `maxReceiveCount` | 5, com redrive para `wager-transactions-dlq.fifo` | Tolera indisponibilidades curtas sem prender mensagens válidas para sempre. |
+| Backoff de falha transitória | visibilidade de 2·2ⁿ⁻¹ s (2, 4, 8, 16), teto de 60s | A mensagem não é removida e volta mais tarde. |
+| Long polling | 20s, até 10 mensagens por recebimento | |
+| Retenção da DLQ | 14 dias | |
+
+Todos os valores são configuráveis (`SQS_*`). As opções descartadas foram: 60s com 3 recebimentos e sem backoff (lento, e uma queda curta do banco mandaria mensagens válidas para a DLQ) e 10 recebimentos (prende por mais tempo as mensagens com problema persistente).
+
+#### Desfecho de cada mensagem
+
+| Resultado do tratamento | Ação |
+|---|---|
+| `PROCESSED`, `REJECTED` (regra de negócio) ou `PENDING_REFERENCE` | Commit e remoção. A rejeição é terminal; a pendência segue com o worker de referências. |
+| Mensagem já na inbox com o mesmo hash | Remoção, sem reprocessar. |
+| Envelope inválido (`INVALID_MESSAGE`), entrada inválida, carteira inexistente, conflito, hash divergente ou invariante violada | Envio à DLQ com os atributos `ErrorCode`, `ErrorDetail`, `SourceQueue` e `OriginalMessageId`, e depois remoção. |
+| Falha transitória (banco indisponível, deadlock, timeout) | Não remove; a visibilidade passa a valer o backoff. Na 5ª recepção sem sucesso, o redrive do SQS move a mensagem para a DLQ (sem `ErrorCode`). |
+| Falha ao enviar para a DLQ | Não remove; tratada como transitória. |
+
+- **Mensagens inválidas vão à DLQ na hora**, em vez de esperar o redrive. Assim não bloqueiam o grupo FIFO da carteira durante 5 recebimentos, e o motivo fica gravado junto da mensagem.
+- **Envelope estrito:** um único objeto JSON, sem campos desconhecidos em nenhum nível, `type = WagerTransactionRequested`, `messageId` válido, `occurredAt` em RFC 3339 e `amount` como string.
+- **Como verificar:**
+  - `TestInvalidMessagesGoToDeadLetterQueue` (8 casos, cada um com o seu `ErrorCode`, sem efeito financeiro);
+  - `TestBusinessOutcomesAreAcknowledged`, `TestTransientFailureIsRetried` e `TestExhaustedRetriesGoToDeadLetterQueue` (exatamente 5 chamadas e depois a DLQ pelo redrive);
+  - testes unitários `TestParseRejectsInvalidEnvelopes`, `TestPermanentVersusTransient` e `TestConsumerBackoff`.
+
+#### Queda entre o commit e a remoção
+
+Se o processo cair depois do commit e antes de remover a mensagem, ela reaparece quando o visibility timeout vence. A inbox reconhece o `messageId` e a mensagem é removida sem reprocessar. `TestCrashAfterCommitBeforeDelete` simula exatamente essa queda e confere que existe um único débito. Uma falha ao remover tem o mesmo efeito.
+
+#### Concorrência dentro de uma instância
+
+- **Opções consideradas:** (a) paralelo entre grupos e em ordem dentro de cada grupo; (b) sequencial por lote; (c) paralelo total.
+- **Prós e contras:**
+  - (a) processa carteiras diferentes ao mesmo tempo sem quebrar a ordem de uma carteira.
+  - (b) faz carteiras independentes esperarem umas pelas outras.
+  - (c) poderia processar fora de ordem duas mensagens da mesma carteira no mesmo lote.
+- **Escolha:** (a). Pollers configuráveis (`SQS_CONSUMER_POLLERS`, padrão 2). Cada lote é separado por `MessageGroupId`; grupos rodam em paralelo e as mensagens de um mesmo grupo são tratadas na ordem de chegada.
+- **Falha no meio de um grupo:** as mensagens seguintes do grupo voltam junto com a que falhou. A ordem já é garantida pelo SQS FIFO, que não entrega mensagens de um grupo enquanto outra dele está em voo; reagendá-las só evita que esperem o visibility timeout inteiro.
+- **Como verificar:** `TestOrderWithinWallet` (aposta de 80 e depois de 30 numa carteira de 100: a primeira passa e a segunda é rejeitada) e `TestHeartbeatKeepsMessageInvisible` (processamento de 5s com visibilidade de 2s: o handler é chamado uma única vez).
+
+#### Encerramento (SIGTERM)
+
+- **Opções consideradas:** (a) concluir o que está em andamento e liberar o restante; (b) liberar tudo imediatamente.
+- **Escolha:** (a). O consumidor para de buscar mensagens na hora. As que estão em processamento terminam dentro de `SHUTDOWN_TIMEOUT`. As recebidas e ainda não iniciadas têm a visibilidade zerada e voltam para outra instância sem esperar o timeout. Se o prazo estourar, o processamento é cancelado: a transação SQL é desfeita e a mensagem volta pelo timeout.
+- **Ordem no Fx:** o consumidor para antes do pool do PostgreSQL (ordem inversa de inicialização), então o trabalho em andamento termina com o banco disponível.
+- **Como verificar:** `TestGracefulShutdown` (3 mensagens da mesma carteira: exatamente 1 concluída e 2 visíveis de novo na hora) e `TestStopDeadlineCancelsInFlight` (prazo estourado: nada gravado, nem a inbox, e a mensagem volta à fila).
+
+#### Acesso ao broker
+
+- **Contexto:** "Acesso à mensageria controlado por credenciais e política do broker, preservando as validações de domínio no consumidor."
+- **Implementação:** o init do LocalStack cria os principals `wager-producer` e `wallet-consumer` e registra as políticas nas filas:
+  - na fila principal, só o produtor envia; só o consumidor recebe, remove e altera a visibilidade;
+  - na DLQ, o consumidor envia mensagens inválidas, e o redrive é aceito apenas a partir da fila principal.
+- **Limitação verificada:** o LocalStack 4.14 comunitário **não aplica IAM**. Num teste com `ENFORCE_IAM=1`, um usuário sem nenhuma permissão conseguiu enviar mensagem. As políticas ficam registradas e valem tal qual na AWS, mas aqui não há teste de acesso negado.
+- **Independente disso**, o consumidor valida cada mensagem como se viesse de fonte não confiável: envelope estrito, todas as regras de domínio, e carteira e jogador conferidos.
+- **Provedor:** pela fila, o `providerId` da mensagem é aceito com base na política do broker, já que não há token. Na AWS, cada provedor teria o seu principal de produtor.
+
+#### Outros comportamentos
+
+- Na partida, o consumidor resolve as URLs das filas. Se o SQS estiver fora do ar nesse momento, a inicialização falha, e no Compose a aplicação só sobe depois do LocalStack saudável. Uma indisponibilidade **durante** a execução apenas faz o recebimento repetir a cada segundo.
+- `SQS_CONSUMER_ENABLED=false` desliga o consumidor, por exemplo para uma instância que só atende HTTP.
+- **A DLQ também é FIFO.** Quem a consome precisa remover cada mensagem lida, porque, enquanto houver mensagens de um grupo em voo, as seguintes do mesmo grupo não são entregues. Isso foi descoberto pelo próprio teste da DLQ.
+
+### 4.15 Decisões pendentes
 
 | # | Decisão | Fase |
 |---|---|---|
-| D9 | `MessageGroupId`, deduplicação, visibility timeout, `maxReceiveCount`, mensagens inválidas | 7 |
 | D10 | Destino dos eventos e contrato de roteamento | 8 |
 
-### 4.15 Composição com Fx e ciclo de vida (parcial)
+### 4.16 Composição com Fx e ciclo de vida (parcial)
 
 - **Contexto:** "Fx compõe configuração, conexões, repositórios, casos de uso, handlers e workers […] fechamento das dependências depois dos componentes que as utilizam."
 - **Implementado até aqui:**
@@ -895,9 +985,10 @@ A API usa `net/http` (`ServeMux` com padrões de método e rota do Go 1.22+), se
   - No `OnStop`, a readiness passa a falhar e o servidor drena as requisições dentro de `SHUTDOWN_TIMEOUT` (`fx.StopTimeout`).
   - O pool do PostgreSQL é fechado depois do servidor (ordem inversa de inicialização do Fx).
 - **Como verificar:** hoje, de forma manual: `docker compose stop app` mostra no log o hook do servidor executando antes do hook do pool. O teste automatizado da composição Fx será feito na Fase 10.
-- **Pendente:** workers (consumidor, publisher, referências) e o shutdown seguro do consumidor SQS.
+- **Consumidor SQS:** ligado ao ciclo de vida (`StartConsumer`), para antes do pool do banco e tem encerramento seguro (§4.14).
+- **Pendente:** publisher da outbox e worker de referências (Fase 8).
 
-### 4.16 Ambiente, ferramentas e testes
+### 4.17 Ambiente, ferramentas e testes
 
 #### Toolchain sem instalação local
 
@@ -969,10 +1060,11 @@ A API usa `net/http` (`ServeMux` com padrões de método e rota do Go 1.22+), se
   - (d) não deixaria evidência reproduzível.
 - **Escolha e justificativa:** (a). O `scripts/mutation.sh` injeta cada defeito numa cópia descartável do código. O resultado é `KILLED`, `SURVIVED`, `INVALID` (mutante que não compila, que não prova nada) ou `ERROR`, e o script falha em qualquer resultado diferente de `KILLED`. O script cresce a cada fase.
 - **Critério impactado:** Testes.
-- **Como verificar:** o comando abaixo, que hoje dá 68 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência, 12 de casos de uso e 11 de HTTP e autenticação (os três últimos grupos com PostgreSQL e Keycloak no ar).
+- **Como verificar:** o comando abaixo, que hoje dá 78 mutantes mortos e 0 problemas: 28 de domínio, 17 de persistência, 12 de casos de uso, 11 de HTTP e autenticação e 10 do consumidor SQS (os quatro últimos grupos com PostgreSQL, Keycloak e LocalStack no ar). `MUTATION_FILTER` roda só os mutantes cujo nome casar com uma expressão regular.
 ```bash
 docker compose run --rm tools bash scripts/mutation.sh
 ```
+- **Mutantes equivalentes:** um mutante que não muda nenhum comportamento observável não é mantido no script; o motivo é registrado aqui. "Falha não segura as seguintes do mesmo grupo" foi removido: a ordem por carteira é garantida pelo próprio SQS FIFO (nenhuma mensagem de um grupo é entregue enquanto outra está em voo), e reagendar as mensagens seguintes só reduz a espera delas. O mutante revelou que o comentário do código dava o motivo errado, e o comentário foi corrigido.
 - **Mutantes sobre comportamento aleatório:** o jitter do backoff faz o resultado de um teste variar entre execuções. Três rodadas seguidas mostraram que o mutante "backoff sem teto" às vezes sobrevivia: sem o teto, a espera seria 64s ±20%, quase toda sobreposta à faixa correta de 60s ±20%, e uma única amostra não bastava. `TestReferencePolicyCapsDelay` passou a amostrar 500 vezes e exigir que nenhuma espera passe de 72s; o mutante é morto de forma estável. Por isso, mudanças em código com aleatoriedade devem rodar o script mais de uma vez.
 - **Limitações:** só cobre os defeitos listados; não substitui revisão.
 
@@ -990,10 +1082,10 @@ docker compose run --rm tools bash scripts/mutation.sh
 |---|---|---|---|
 | Integridade financeira | 20 | Money exato e sem float (`TestNoFloatingPointInProductionCode`); invariantes da Wallet e do ledger; regras dos 5 tipos; reversões (§4.1, §4.4, §4.8). No banco: saldo ≥ 0, ledger append-only (privilégio + trigger), cadeia do ledger e conferência saldo × ledger no commit, máquina de estados e regras dos tipos (§4.11); reconciliação em snapshot único que detecta divergência sem alterar o saldo (`TestReconciliation`, §4.12) | — |
 | Concorrência | 20 | `FOR UPDATE` por carteira + versão no UPDATE (D1); `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`, `TestIndependentWalletsDoNotBlock`, `TestLockTimeoutIsTransient` (§4.11); `TestFiftyIdenticalBetsInParallel`, `TestTwoBetsOf80OnWalletWith100`, `TestIndependentWalletsInParallel` (§4.12) | testes com ≥ 3 processos |
-| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12) | HTTP × SQS |
-| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12) | consumidor, publisher, loop do worker, DLQ, shutdown |
-| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.15); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
-| Testes | 10 | testes unitários e de integração (repositórios, casos de uso e API com Keycloak real) com PostgreSQL real, todos com `-race`; 68/68 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso, 11 de HTTP e autenticação (§4.16) | paralelismo multiprocesso, interrupção, SQS |
+| Idempotência | 15 | hash canônico versionado; `CheckReplay` (§4.7); unicidade por provedor e por operação no banco (`TestIdempotencyConstraints`); fluxo de replay com o resultado original, conflitos e chave não consumida por erro corrigível (§4.12); HTTP × SQS nas duas ordens e reentregas deduplicadas pela inbox (§4.14) | reinício de todos os processos |
+| Mensageria e recuperação | 15 | máquina de estados e regras de espera (§4.5, §4.8); tabelas de inbox e outbox com deduplicação e snapshot imutável (§4.11); espera durável por referência com backoff, expiração e resolução única entre instâncias; retry de falhas transitórias (§4.12); consumidor com inbox na mesma transação, DLQ imediata para erros permanentes, backoff e redrive, queda entre commit e remoção, heartbeat e encerramento seguro (§4.14) | publisher da outbox, loop do worker |
+| Modelagem e arquitetura | 10 | domínio isolado (`TestDomainHasNoInfrastructureImports`); erros tipados; UnitOfWork e repositórios (D11); módulos Fx (§1.2, §4.3, §4.16); autenticação OIDC, scopes por operação e isolamento por provedor (§4.13) | — |
+| Testes | 10 | testes unitários e de integração (repositórios, casos de uso, API com Keycloak real e consumidor com LocalStack real) com PostgreSQL real, todos com `-race`; 78/78 mutantes mortos: 28 de domínio, 17 de SQL e repositórios, 12 de casos de uso, 11 de HTTP e autenticação, 10 do consumidor (§4.17) | paralelismo multiprocesso, falhas com Toxiproxy |
 | Observabilidade | 5 | logs JSON; `/health/live`; `/health/ready` com PostgreSQL e SQS | IDs nos logs; métricas |
 | Documentação | 5 | este documento e o README | revisão final |
 
@@ -1011,14 +1103,15 @@ docker compose run --rm tools bash scripts/mutation.sh
 | Carteiras independentes em paralelo; nenhum lock global | ✅ (um processo) | lock só na linha da carteira; `TestIndependentWalletsDoNotBlock`. Multiprocesso na Fase 10 |
 | Sem lost updates no saldo | ✅ (um processo) | `TestConcurrentDebitsDoNotLoseUpdates`, `TestTwoConcurrentBetsOf80On100`. Multiprocesso na Fase 10 |
 | Unicidade, não negatividade e imutabilidade impostas pelo banco | ✅ | índices únicos, `CHECK (balance_minor >= 0)` e triggers (§4.11) |
-| Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | pendente | Fase 10 |
+| Sem duplicidade, saldo negativo ou perda de evento nas situações listadas | parcial | Em um processo: recebimento repetido por HTTP e SQS (`TestHTTPAndSQSShareIdempotency`, `TestRedeliveredMessageIsNotReprocessed`); reversão antes da referência; processamento simultâneo na mesma carteira; queda entre commit e remoção da mensagem (`TestCrashAfterCommitBeforeDelete`); indisponibilidade temporária (retry e backoff). Pendentes: publicação repetida de eventos (Fase 8) e a repetição com ≥ 3 processos, quedas abruptas e Toxiproxy (Fase 10) |
 
 ---
 
 ## 7. Limitações e trabalho não concluído
 
-- Consumidor SQS, publisher da outbox, loop do worker de referências e métricas ainda não foram implementados (ver §2).
-- As decisões D9 e D10 estão pendentes (§4.14).
+- Publisher da outbox, loop do worker de referências e métricas ainda não foram implementados (ver §2).
+- A decisão D10 está pendente (§4.15).
+- O LocalStack comunitário não aplica as políticas de acesso das filas (§4.14).
 - A concorrência só foi demonstrada com um processo; a prova com ≥ 3 processos independentes fica para a Fase 10.
 - O banco não confere que a transação está `PROCESSED` quando o seu lançamento é gravado (§4.11).
 - Moedas limitadas a BRL, USD e EUR, todas com 2 casas decimais.

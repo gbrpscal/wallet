@@ -4,12 +4,14 @@ package sqs
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"go.uber.org/fx"
 
+	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/platform/config"
 	"github.com/gbrpscal/wallet/internal/platform/health"
 )
@@ -20,7 +22,27 @@ var Module = fx.Module("sqs",
 		NewClient,
 		health.AsChecker(NewReadinessCheck),
 	),
+	fx.Invoke(StartConsumer),
 )
+
+// ConsumerName identifica este consumidor na inbox.
+const ConsumerName = "wager-transactions-consumer"
+
+// StartConsumer liga o consumidor ao ciclo de vida do Fx. Ele para antes do
+// pool do PostgreSQL (ordem inversa de inicialização), então o trabalho em
+// andamento termina com o banco ainda disponível.
+func StartConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, svc *app.Service, log *slog.Logger) {
+	if !cfg.ConsumerEnabled {
+		log.Info("sqs consumer disabled")
+		return
+	}
+	c := NewConsumer(client, svc, ConsumerConfig{
+		Name: ConsumerName, QueueName: cfg.WagerQueueName, DLQName: cfg.WagerDLQName,
+		Pollers: cfg.ConsumerPollers, WaitTime: cfg.ConsumerWaitTime, Visibility: cfg.ConsumerVisibility,
+		RetryBase: cfg.ConsumerRetryBase, RetryMax: cfg.ConsumerRetryMax,
+	}, log)
+	lc.Append(fx.Hook{OnStart: c.Start, OnStop: c.Stop})
+}
 
 // NewClient constrói um cliente SQS. As credenciais vêm das variáveis de
 // ambiente padrão da AWS; o endpoint sobrescrito aponta para o emulador local.
