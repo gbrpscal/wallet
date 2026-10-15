@@ -77,6 +77,10 @@ const (
 	// ResolveSkipped: outra instância já tratou a transação ou ela ainda não
 	// venceu.
 	ResolveSkipped ResolveStatus = "skipped"
+	// ResolveFailed: a tentativa encontrou dado persistido inconsistente; a
+	// transação foi registrada como FAILED (INCONSISTENT_STATE), sem
+	// movimentação, e deixa de ser retentada.
+	ResolveFailed ResolveStatus = "failed"
 )
 
 // openWallet contém a abertura; OpenWallet a mede.
@@ -314,8 +318,42 @@ func (s *Service) ResolvePendingReference(ctx context.Context, id domain.Transac
 			return err
 		})
 	})
+	if code, ok := domain.CodeOf(err); ok && code == domain.CodeInconsistentState {
+		status, t, err = s.markFailed(ctx, id, err)
+	}
 	s.recordResolution(status, t, err, time.Since(start))
 	return status, err
+}
+
+// markFailed registra como FAILED uma pendência cuja resolução encontrou dado
+// inconsistente: nenhuma nova tentativa resolveria. Roda numa transação
+// própria, porque a da tentativa foi desfeita; a gravação só acontece se a
+// transação continua em PENDING_REFERENCE. Se a própria transação não puder
+// ser lida, o erro original volta e a pendência segue no próximo ciclo.
+func (s *Service) markFailed(ctx context.Context, id domain.TransactionID, cause error) (ResolveStatus, *wagering.WagerTransaction, error) {
+	var t *wagering.WagerTransaction
+	err := s.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
+		var err error
+		if t, err = tx.Transactions().Get(ctx, id); err != nil {
+			return err
+		}
+		if t.Status() != wagering.PendingReference {
+			return ErrConcurrentUpdate
+		}
+		if err := t.MarkFailed(domain.CodeInconsistentState, s.clock.Now()); err != nil {
+			return err
+		}
+		return tx.Transactions().Save(ctx, t, wagering.PendingReference, nil)
+	})
+	if errors.Is(err, ErrConcurrentUpdate) {
+		return ResolveSkipped, nil, nil // outra instância concluiu antes
+	}
+	if err != nil {
+		return "", nil, cause
+	}
+	s.log.ErrorContext(logctx.With(ctx, logctx.WalletID, t.WalletID().String(), logctx.ProviderID, t.ProviderID()),
+		"pending reference failed permanently", "failureCode", string(domain.CodeInconsistentState), "error", cause)
+	return ResolveFailed, t, nil
 }
 
 // recordResolution registra uma tentativa do worker: a tentativa em si, a

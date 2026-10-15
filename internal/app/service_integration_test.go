@@ -6,14 +6,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gbrpscal/wallet/internal/adapters/postgres"
 	"github.com/gbrpscal/wallet/internal/app"
 	"github.com/gbrpscal/wallet/internal/domain"
 	"github.com/gbrpscal/wallet/internal/domain/wagering"
+	"github.com/gbrpscal/wallet/internal/domain/wallet"
 )
 
 func TestOpenWallet(t *testing.T) {
@@ -619,5 +622,92 @@ func TestSameKeyFromAnotherProviderIsIndependent(t *testing.T) {
 	}
 	if h.balance(t, walletID) != "80.00" {
 		t.Fatalf("balance = %s", h.balance(t, walletID))
+	}
+}
+
+// inconsistentWalletUoW delega à unidade de trabalho real, mas a leitura com
+// lock de uma carteira específica devolve dado persistido inconsistente (como
+// uma linha corrompida que o domínio recusa reidratar).
+type inconsistentWalletUoW struct {
+	app.UnitOfWork
+	walletID domain.WalletID
+}
+
+func (u inconsistentWalletUoW) Do(ctx context.Context, fn func(ctx context.Context, tx app.Tx) error) error {
+	return u.UnitOfWork.Do(ctx, func(ctx context.Context, tx app.Tx) error {
+		return fn(ctx, inconsistentTx{Tx: tx, walletID: u.walletID})
+	})
+}
+
+type inconsistentTx struct {
+	app.Tx
+	walletID domain.WalletID
+}
+
+func (t inconsistentTx) Wallets() app.WalletRepository {
+	return inconsistentWallets{WalletRepository: t.Tx.Wallets(), walletID: t.walletID}
+}
+
+type inconsistentWallets struct {
+	app.WalletRepository
+	walletID domain.WalletID
+}
+
+func (w inconsistentWallets) Lock(ctx context.Context, id domain.WalletID) (*wallet.Wallet, error) {
+	if id == w.walletID {
+		return nil, domain.Errorf(domain.ErrInconsistentState, "wallet %s has invalid timestamps", id)
+	}
+	return w.WalletRepository.Lock(ctx, id)
+}
+
+// TestPendingReferenceWithInconsistentDataFails: uma pendência cuja resolução
+// encontra dado persistido inconsistente é registrada como FAILED
+// (INCONSISTENT_STATE), sem movimentação nem evento, e não é retentada.
+func TestPendingReferenceWithInconsistentDataFails(t *testing.T) {
+	h := newHarness()
+	ctx := context.Background()
+	walletID := h.open(t, "100.00")
+	pending := h.submit(t, h.request(t, walletID, "broken-refund", "REFUND", "10.00", "broken-bet"))
+	h.submit(t, h.request(t, walletID, "broken-bet", "BET", "10.00", ""))
+	entriesBefore := ledgerCount(t, walletID)
+	h.clock.Advance(10 * time.Second)
+
+	broken := app.NewService(inconsistentWalletUoW{UnitOfWork: postgres.NewUnitOfWork(appPool, 5*time.Second, app.NopMetrics{}),
+		walletID: domain.MustParseID[domain.WalletID](walletID)}, h.clock, app.RetryPolicy{Retries: 1, BaseDelay: time.Millisecond},
+		testPolicy, app.NopMetrics{}, slog.New(slog.NewJSONHandler(h.logs, nil)))
+	st, err := broken.ResolvePendingReference(ctx, pending.Transaction.ID())
+	if err != nil || st != app.ResolveFailed {
+		t.Fatalf("resolve = %s, %v; want failed", st, err)
+	}
+
+	tx, err := h.svc.GetTransaction(ctx, pending.Transaction.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.Status() != wagering.Failed || tx.FailureCode() != domain.CodeInconsistentState {
+		t.Fatalf("transaction = %s %s, want FAILED INCONSISTENT_STATE", tx.Status(), tx.FailureCode())
+	}
+	if n := ledgerCount(t, walletID); n != entriesBefore {
+		t.Fatalf("ledger entries %d -> %d; a failed transaction must not move money", entriesBefore, n)
+	}
+	if n := countRows(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type <> 'WagerTransactionPendingReference'`,
+		pending.Transaction.ID().String()); n != 0 {
+		t.Fatalf("%d events for a failed transaction", n)
+	}
+	due, err := h.svc.DuePendingReferences(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range due {
+		if d.TransactionID == pending.Transaction.ID() {
+			t.Fatal("failed transaction is still scheduled for retries")
+		}
+	}
+	if !strings.Contains(h.logs.String(), "pending reference failed permanently") {
+		t.Error("permanent failure not logged")
+	}
+	// Uma nova tentativa encontra a transação terminal e não faz nada.
+	if st, err := h.svc.ResolvePendingReference(ctx, pending.Transaction.ID()); err != nil || st != app.ResolveSkipped {
+		t.Fatalf("resolve after failure = %s, %v; want skipped", st, err)
 	}
 }

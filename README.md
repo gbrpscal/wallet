@@ -2,9 +2,7 @@
 
 Serviço em Go de carteiras de jogadores e wagering. Expõe uma API HTTP e um consumidor SQS FIFO que movimentam saldo com as mesmas garantias de integridade financeira, concorrência e idempotência.
 
-As decisões técnicas estão em [ARCHITECTURE.md](ARCHITECTURE.md).
-
-> **Em desenvolvimento.** Este README é atualizado a cada fase. Os itens marcados como *pendente* ainda não estão disponíveis.
+As decisões técnicas estão em [ARCHITECTURE.md](ARCHITECTURE.md), que também traz a [matriz de rastreabilidade](ARCHITECTURE.md#8-matriz-de-rastreabilidade): cada exigência do enunciado ligada ao código, aos testes e à documentação.
 
 ## Sumário
 
@@ -384,7 +382,7 @@ docker compose run --rm tools curl -s http://app:9090/metrics
 | `wallet_outbox_pending_events` | gauge | — | eventos ainda não publicados |
 | `wallet_outbox_oldest_pending_age_seconds` | gauge | — | idade do evento pendente mais antigo |
 | `wallet_reconciliations_total` | counter | `result` | `consistent` ou `divergent` |
-| `wallet_pending_reference_attempts_total` | counter | `result` | tentativas do worker: `waiting`, `completed`, `expired` |
+| `wallet_pending_reference_attempts_total` | counter | `result` | tentativas do worker: `waiting`, `completed`, `expired`, `failed` |
 
 `channel` é `http`, `sqs` ou `worker`. Também são expostas as métricas padrão do runtime Go (`go_*`) e do processo (`process_*`). Nenhuma métrica carrega valor monetário (as métricas Prometheus são `float64`), nem ids de carteira ou de provedor, que gerariam cardinalidade sem limite.
 
@@ -455,6 +453,7 @@ Os testes `TestSaveDetectsStaleVersion`, `TestLockTimeoutIsTransient` e `TestIde
 | `TestReversalBeforeReferenceResolvedByWorker` | REFUND antes da BET fica pendente e é concluído pelo worker, com o correlationId original nos eventos |
 | `TestPendingReferenceExpiresAfterMaxAttempts`, `TestPendingReferenceExpiresAfterTTL` | expiração com `REFERENCE_NOT_FOUND` e evento de rejeição |
 | `TestConcurrentResolversProcessOnce` | várias tentativas simultâneas concluem a pendência uma única vez |
+| `TestPendingReferenceWithInconsistentDataFails` | pendência com dado persistido inconsistente vira `FAILED` (`INCONSISTENT_STATE`), sem movimentação nem evento, e sai do agendamento |
 | `TestRefundAndRollbackOfTheSameBet`, `TestRollbackOfWinWithoutFunds` | devolução única por aposta; reversão sem saldo com código próprio |
 | `TestReconciliation` | reconciliação consistente e detecção de divergência (log e resposta) sem alterar o saldo |
 | `TestLedgerPagination`, `TestTransactionLookupsAreProviderScoped`, `TestSameKeyFromAnotherProviderIsIndependent` | cursor opaco e limites; consultas e replays isolados por provedor |

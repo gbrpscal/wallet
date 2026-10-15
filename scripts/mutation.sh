@@ -276,6 +276,8 @@ mutate "reconciliação sempre contada como consistente" internal/app/service.go
   's.metrics.Reconciliation(r.Consistent)' 's.metrics.Reconciliation(true)' $APP integration
 mutate "log de expiração carrega o valor" internal/app/service.go \
   '"pending reference expired", "attempts", next.Attempts)' '"pending reference expired", "attempts", next.Attempts, "amount", t.Money().Amount())' $APP integration
+mutate "pendência inconsistente não vira FAILED" internal/app/service.go \
+  'if code, ok := domain.CodeOf(err); ok && code == domain.CodeInconsistentState {' 'if false {' $APP integration
 mutate "worker sem transactionId no contexto de log" internal/app/service.go \
   'ctx = logctx.With(ctx, logctx.TransactionID, id.String())' '_ = logctx.TransactionID' $APP integration
 
