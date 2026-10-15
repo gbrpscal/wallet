@@ -6,6 +6,7 @@ As decisões técnicas estão em [ARCHITECTURE.md](ARCHITECTURE.md), que também
 
 ## Sumário
 
+- [Guia rápido](#guia-rápido)
 - [Pré-requisitos](#pré-requisitos)
 - [Container de toolchain](#container-de-toolchain)
 - [Execução da aplicação](#execução-da-aplicação)
@@ -16,7 +17,80 @@ As decisões técnicas estão em [ARCHITECTURE.md](ARCHITECTURE.md), que também
 - [Observabilidade](#observabilidade)
 - [Testes](#testes)
 - [Testes de integração, múltiplas instâncias e falha](#testes-de-integração-múltiplas-instâncias-e-falha)
+- [Solução de problemas](#solução-de-problemas)
 - [Estrutura do repositório](#estrutura-do-repositório)
+
+## Guia rápido
+
+O caminho completo, do código à verificação, só com Docker. Cada passo traz o resultado esperado e aponta para a seção com os detalhes.
+
+**1. Subir o ambiente.** Na raiz do projeto (clonado com `git clone` ou extraído do arquivo entregue):
+
+```bash
+docker compose up --build -d --wait
+```
+
+Na primeira vez, as imagens são baixadas e compiladas (alguns minutos). Ao terminar, `postgres`, `keycloak`, `localstack` e `app` aparecem como `Healthy`, e o serviço `migrate` termina com código 0 depois de aplicar as migrations. As filas, o tópico e o realm do Keycloak são criados automaticamente. Para conferir:
+
+```bash
+docker compose ps -a
+```
+
+**2. Conferir os health checks.** Esperado: `{"status":"ok"}` e `{"status":"ok","checks":{"postgres":"ok","sqs":"ok"}}`.
+
+```bash
+docker compose run --rm tools curl -s http://app:8080/health/live
+```
+
+```bash
+docker compose run --rm tools curl -s http://app:8080/health/ready
+```
+
+**3. Executar o fluxo do enunciado** (abertura, aposta, replay e reconciliação). Abra um shell no container `tools`:
+
+```bash
+docker compose run --rm tools bash
+```
+
+e, dentro dele, cole o bloco abaixo. Cada execução usa um jogador novo, então o bloco pode ser repetido:
+
+```bash
+KC=http://keycloak:8080/realms/wallet/protocol/openid-connect/token; API=http://app:8080
+tok() { curl -s -u "$1:$1-secret" -d grant_type=client_credentials $KC | sed -E 's/.*"access_token":"([^"]+)".*/\1/'; }
+BO=$(tok wallet-backoffice); PA=$(tok provider-a); PLAYER=$(cat /proc/sys/kernel/random/uuid)
+WALLET=$(curl -s -X POST $API/wallets -H "Authorization: Bearer $BO" -H 'Content-Type: application/json' \
+  -d "{\"playerId\":\"$PLAYER\",\"initialBalance\":{\"amount\":\"1000.00\",\"currency\":\"BRL\"}}" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+BET="{\"providerId\":\"provider-a\",\"externalTransactionId\":\"bet-$PLAYER\",\"playerId\":\"$PLAYER\",\"walletId\":\"$WALLET\",\"roundId\":\"round-987\",\"gameId\":\"fortune-chimp\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}"
+for i in 1 2; do curl -s -X POST $API/wagering/transactions -H "Authorization: Bearer $PA" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: provider-a:bet-$PLAYER" -d "$BET"; echo; done
+curl -s -X POST $API/wallets/$WALLET/reconciliation -H "Authorization: Bearer $BO"; echo
+```
+
+Esperado: a primeira aposta com `"status":"PROCESSED"`, `"balance":{"amount":"975.00",...}` e `"idempotentReplay":false`; a segunda com o mesmo `transactionId` e `"idempotentReplay":true`; a reconciliação com `"consistent":true` e `"checkedEntries":2`. Saia do shell com `exit`. Mais chamadas, os clients disponíveis e os códigos de resposta estão em [Exemplos de chamadas](#exemplos-de-chamadas).
+
+**4. Enviar uma operação pelo SQS.** O comando está em [Contrato da mensagem](#contrato-da-mensagem); use o `id` de uma carteira existente. A mensagem é consumida em poucos segundos, e o saldo pode ser conferido com `GET /wallets/{id}`.
+
+**5. Ler as métricas** (porta interna, não publicada no host). Esperado: séries `wallet_operations_total`, `wallet_duplicates_total` e as demais do [catálogo](#métricas).
+
+```bash
+docker compose run --rm tools sh -c "curl -s http://app:9090/metrics | grep '^wallet_' | grep -v _bucket"
+```
+
+**6. Rodar os testes**, todos pelo container `tools`:
+
+| Suíte | Comando | Tempo aproximado |
+|---|---|---|
+| Formatação (não deve listar nada) | `docker compose run --rm tools gofmt -l .` | segundos |
+| Análise estática | `docker compose run --rm tools go vet ./...` | segundos |
+| Unitários | `docker compose run --rm tools go test ./...` | segundos |
+| Unitários com race detector | `docker compose run --rm tools go test -race ./...` | < 1 min |
+| Integração (PostgreSQL, Keycloak e LocalStack reais) | `docker compose run --rm tools go test -race -tags=integration ./internal/...` | ~2 min |
+| Resiliência (3 processos, SIGKILL, Toxiproxy) | `docker compose run --rm tools go test -tags=resilience -v ./test/resilience/` | 2 a 3 min |
+| Mutação (prova que os testes detectam defeitos) | `docker compose run --rm tools bash scripts/mutation.sh` | 20 a 30 min |
+
+Todos os pacotes devem terminar com `ok`; o script de mutação termina com `problemas: 0`. As suítes estão descritas em [Testes](#testes) e em [Testes de integração, múltiplas instâncias e falha](#testes-de-integração-múltiplas-instâncias-e-falha).
+
+**7. Encerrar.** `docker compose down` para a stack; `docker compose down -v` também apaga os dados (banco e caches).
 
 ## Pré-requisitos
 
@@ -582,6 +656,25 @@ Todo cenário termina conferindo que o saldo de cada carteira bate com o ledger,
 - A queda entre o commit e a remoção da mensagem é provocada sob carga, e o teste exige evidência de que a janela foi atingida. O ponto exato é coberto de forma determinística pelos testes de integração do consumidor.
 
 As demais limitações do projeto estão em [ARCHITECTURE.md](ARCHITECTURE.md) (§7).
+
+## Solução de problemas
+
+| Sintoma | Causa provável | O que fazer |
+|---|---|---|
+| `docker compose up` falha com "port is already allocated" | as portas 8080 (API) ou 8180 (Keycloak) estão em uso no host | crie um `.env` (`cp .env.example .env`) e troque `APP_HOST_PORT` e/ou `KEYCLOAK_HOST_PORT`; o emissor dos tokens acompanha a porta do Keycloak automaticamente |
+| `app` não fica `Healthy` | dependência ainda subindo ou configuração inválida | veja `docker compose logs app`; uma configuração inválida encerra o processo na partida com a lista de erros, e uma dependência fora do ar aparece em `/health/ready` |
+| `migrate` termina com erro | o PostgreSQL ainda não aceitava conexões, ou o volume tem um estado anterior incompatível | rode `docker compose up --build -d --wait` de novo; se persistir, recomece do zero com `docker compose down -v` |
+| Arquivos gerados pelo container `tools` pertencem a outro usuário | o seu UID/GID não é 1000 | no `.env`, ajuste `HOST_UID` e `HOST_GID` com os valores de `id -u` e `id -g` |
+| LocalStack encerra com "License activation failed" | a tag do LocalStack foi trocada por uma versão que exige conta | volte para `4.14.0` ou defina `LOCALSTACK_AUTH_TOKEN` (veja [LocalStack em outra máquina](#localstack-em-outra-máquina)) |
+| `401` em uma rota de negócio | token ausente, expirado ou de outro emissor | obtenha um token novo do Keycloak da mesma stack; os tokens do client `provider-short-lived` expiram em 2 segundos de propósito |
+| `403` em uma rota de negócio | o client não tem o scope da rota, ou o `providerId` do corpo é diferente do token | carteiras e reconciliação usam `wallet-backoffice`; operações usam o client do próprio provedor (veja [Autenticação](#autenticação)) |
+| `409` ao abrir a carteira do exemplo do [Fluxo completo](#fluxo-completo) | já existe carteira para aquele `playerId` e moeda | use outro `playerId` (o [Guia rápido](#guia-rápido) gera um a cada execução) ou recomece com `docker compose down -v` |
+| Testes de integração falham com "DATABASE_OWNER_URL and DATABASE_URL are required" | foram rodados fora do container `tools` | use os comandos com `docker compose run --rm tools`, que já definem as variáveis; na forma nativa, exporte-as (veja [Testes de integração](#testes-de-integração-persistência-casos-de-uso-api-sqs-e-workers)) |
+| Testes de integração ou de resiliência falham ao conectar no banco, no Keycloak ou no LocalStack | a stack não está no ar | `docker compose up --build -d --wait` antes de rodar os testes |
+| Testes de resiliência falham com "toxiproxy unreachable" | o Toxiproxy não está no ar | suba a stack inteira (`docker compose up --build -d --wait`), não só as dependências |
+| O script de mutação para com "linha de base falhou" | os testes falham sem mutação, normalmente por ambiente fora do ar | as últimas linhas da saída mostram o motivo; suba a stack e rode de novo |
+| `curl localhost:9090/metrics` não conecta no host | é proposital: a porta de métricas não é publicada | leia pela rede interna, como no passo 5 do [Guia rápido](#guia-rápido) |
+| Quero recomeçar do zero | — | `docker compose down -v` apaga banco, filas e caches; depois, `docker compose up --build -d --wait` |
 
 ## Estrutura do repositório
 
